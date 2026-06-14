@@ -783,6 +783,108 @@ t_hasnt "row big-disk-with-ESP NOT tagged media (size gate)" "$RU" "[media?]"
 unset -f disklabel dmesg mount 2>/dev/null
 
 # ===========================================================================
+# 12b. HOMELY CAPACITY GATE (velo_profile_target_size_ok).  The homely desktop
+#      closure exhausted /usr on a 16 GiB live run and left the target
+#      inconsistent on the next boot, so a homely target below
+#      VELO_HOMELY_MIN_BYTES (28 GiB) is refused BEFORE the destroy-gate;
+#      minimal/fortress bypass the gate entirely.  Drive the pure predicate with
+#      a disklabel stub (valid sdN names so is_valid_disk passes); cover the
+#      EXACT 28-GiB boundary, one sector under, an unreadable label, and the
+#      non-homely bypass.  The 28-GiB constant is also pinned so a future edit
+#      of the threshold trips a visible assertion.
+# ===========================================================================
+t_eq "homely min-bytes constant == 28 GiB" "30064771072" "$VELO_HOMELY_MIN_BYTES"
+disklabel() {
+	case "$1" in
+	sd3) cat <<'L'
+duid: 0000000000000000
+bytes/sector: 512
+total sectors: 2801024
+L
+		;;                                              # ~1.34 GiB (well under)
+	sd4) cat <<'L'
+duid: 0000000000000000
+bytes/sector: 512
+total sectors: 937703088
+L
+		;;                                              # ~447 GiB
+	sd5) cat <<'L'
+duid: 0000000000000000
+bytes/sector: 512
+total sectors: 58720256
+L
+		;;                                              # EXACTLY 28 GiB (boundary)
+	sd6) cat <<'L'
+duid: 0000000000000000
+bytes/sector: 512
+total sectors: 58720255
+L
+		;;                                              # one sector UNDER 28 GiB
+	*) return 1 ;;                                          # sd7 -> disklabel fails
+	esac
+}
+velo_profile_target_size_ok sd4 homely; t_rc "size-gate homely 447G accept"            0 $?
+velo_profile_target_size_ok sd3 homely; t_rc "size-gate homely 1.3G reject"            1 $?
+velo_profile_target_size_ok sd5 homely; t_rc "size-gate homely EXACTLY 28 GiB accept (-ge)" 0 $?
+velo_profile_target_size_ok sd6 homely; t_rc "size-gate homely one-sector-under reject" 1 $?
+velo_profile_target_size_ok sd7 homely; t_rc "size-gate homely unreadable label reject" 1 $?
+# minimal/fortress are exempt -- the gate returns 0 even on the tiny disk, and
+# without ever needing a readable size.
+velo_profile_target_size_ok sd3 minimal;  t_rc "size-gate minimal bypasses (tiny ok)"  0 $?
+velo_profile_target_size_ok sd3 fortress; t_rc "size-gate fortress bypasses (tiny ok)" 0 $?
+# on the homely accept path it leaves _VDP_* populated so velo_execute can report
+# the detected size in its refuse/summary line without re-probing the disk.
+velo_profile_target_size_ok sd4 homely
+t_eq "size-gate leaves _VDP_SECT populated for caller" "937703088" "$_VDP_SECT"
+unset -f disklabel 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# 12c. BEHAVIOURAL: the homely capacity gate REFUSES inside velo_execute BEFORE
+#      any confirm or crypto.  Sections 8d/8e deliberately set PROFILE=minimal to
+#      SKIP this gate, so its enforcement on the REAL destructive path is
+#      otherwise unproven -- a mutation dropping the size check at velo-install
+#      line ~1458 would survive every structural grep.  So drive velo_execute
+#      with a homely profile and velo_disk_probe shadowed to report the size; the
+#      arming env is contained in a subshell so it cannot leak.
+#        A  tiny target (< 28 GiB) -> rc1, MUST NOT confirm, MUST NOT reach crypto.
+#        B  ample target (>= 28 GiB) -> reaches confirm (positive control: proves
+#           A's "confirm not called" isn't vacuous; confirm then cancels so B
+#           writes nothing).
+# ---------------------------------------------------------------------------
+_HSG=$(
+	VELO_ALLOW_EXECUTE=yes          # arm (contained in this subshell only)
+	VELO_S_PROFILE=homely
+	VELO_S_DISK=sd0
+	VELO_S_ENCRYPT=yes; VELO_S_BOOTMODE=uefi   # resolvable mode; crypto path live
+	VELO_HAS_PRINT=1; VELO_S_ROOTPW=x; VELO_S_USERPW=x
+	# Satisfy the read-only pre-flight so case B actually REACHES the confirm gate.
+	velo_disk_busy()       { return 1; }            # target not mounted
+	velo_disk_is_media()   { return 1; }            # target is NOT the medium
+	velo_find_media_disk() { echo sd1; return 0; }  # a unique medium exists
+	is_valid_disk()        { return 0; }
+	encrypt()              { echo '$2b$10$stub'; }   # bcrypt-shaped hash
+	velo_clear()               { return 0; }
+	velo_confirm_destructive() { _CONF=called; return 1; }   # record + cancel
+	velo_run_crypto()          { _CRYP=called; return 0; }   # must never run in A
+	# Case A: tiny homely target -> capacity gate refuses pre-confirm.
+	velo_disk_probe() { _VDP_SECT=2801024;  _VDP_BPS=512; return 0; }   # ~1.34 GiB
+	_CONF=no; _CRYP=no
+	velo_execute >/dev/null 2>&1; _rcA=$?
+	_confA=$_CONF; _crypA=$_CRYP
+	# Case B: ample homely target -> gate passes, reaches confirm (which cancels).
+	velo_disk_probe() { _VDP_SECT=937703088; _VDP_BPS=512; return 0; }  # ~447 GiB
+	_CONF=no; _CRYP=no
+	velo_execute >/dev/null 2>&1
+	_confB=$_CONF
+	echo "$_rcA|$_confA|$_crypA|$_confB"
+)
+_OIFS=$IFS; IFS='|'; set -- $_HSG; IFS=$_OIFS
+t_eq "homely gate REFUSES (rc1) a sub-28-GiB target"     "1"      "$1"
+t_eq "homely gate refused BEFORE confirm"                "no"     "$2"
+t_eq "homely gate refused BEFORE crypto"                 "no"     "$3"
+t_eq "homely gate PASSES ample target -> confirm (ctrl)" "called" "$4"
+
+# ===========================================================================
 # 13. ARMED-AWARE SAFETY MESSAGES (welcome + summary tell the truth on armed
 #     media).  velo_armed is 0 iff VELO_ALLOW_EXECUTE=yes; on armed media both
 #     screens must WARN of a real disk erase, otherwise say DRY-RUN.  Shadow the

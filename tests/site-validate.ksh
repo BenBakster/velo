@@ -89,7 +89,13 @@ $PARSE "$INSTALL_SITE" 2>/tmp/velo_v_a1.$$
 v_true "install.site parses ($PARSE)" $?
 $PARSE "$PACKER" 2>/tmp/velo_v_a2.$$
 v_true "make-site-tgz.sh parses ($PARSE)" $?
-rm -f /tmp/velo_v_a1.$$ /tmp/velo_v_a2.$$
+# The offline package-closure validator ships in build/; it must parse clean
+# under the same shell (it runs standalone with `sh` on the build host).
+CLOSURE="$REPO/build/check-pkg-closure.sh"
+v_file "check-pkg-closure.sh present" "$CLOSURE"
+$PARSE "$CLOSURE" 2>/tmp/velo_v_a3.$$
+v_true "check-pkg-closure.sh parses ($PARSE)" $?
+rm -f /tmp/velo_v_a1.$$ /tmp/velo_v_a2.$$ /tmp/velo_v_a3.$$
 
 # ===========================================================================
 # B. No network fetch; appends (>>) not clobbers (>) for rc.firsttime/sysctl.
