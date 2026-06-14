@@ -1,7 +1,9 @@
 # velo — HANDOFF (после homely qemu acceptance, 2026-06-13)
 
 Состояние на конец последней сессии. Подробности по сессиям — `docs/WORKLOG.md`;
-дизайн — `docs/m{0,1,2,3}-*.md`, `PLAN.md`. **Push НЕ делался.**
+дизайн — `docs/m{0,1,2,3}-*.md`, `PLAN.md`. **Push:** при аварийном
+восстановлении 2026-06-14 содержимое опубликовано на GitHub
+(`docs/RECOVERY-2026-06-14.md`); дальнейший push — только по явному «пуш».
 
 > **➡️ СЛЕДУЮЩАЯ СЕССИЯ — НАЧНИ ОТСЮДА:** **homely qemu acceptance — ✅ ЗАКРЫТ**
 > (2026-06-13 вечер, Grok). Полный цикл на **28 GiB** target без переустановки:
@@ -133,7 +135,8 @@
 - **Реальные диски** — только supervised (Ворота-СТОП).
 
 ## Как возобновить
-- Репо: `~/Документи/_Проекты/velo` (git, без remote). `git log --oneline`.
+- Репо: `~/Документи/_Проекты/velo` (git, GitHub-remote `origin` = `BenBakster/velo`;
+  push только по явному «пуш»). `git log --oneline`.
 - Тест-pdksh на Void: `/usr/sbin/ksh`. Демо рамки: `bash demo/tui-demo.ksh screenshot`.
 - Сборка site: `ksh build/make-site-tgz.sh` → `dist/site79.tgz` (gitignored).
 

@@ -35,7 +35,7 @@ Velo = **guided pre-installer для OpenBSD** (аналог Calamares на Linu
 | Build-цепочка целостности (signify fw + sha256) | ✅ 2026-06-11 |
 | Ворота-0 | ✅ installer framework (архив и SATYR-gateway отклонены) |
 
-Репо: `~/Документи/_Проекты/velo` (локальный git, **без remote**, push только по явному «пуш»).
+Репо: `~/Документи/_Проекты/velo` (git, опубликован на GitHub `BenBakster/velo`; **push только по явному «пуш»**).
 
 **Hard stop (не нарушать):**
 - `sda` не трогать (Void-portable root);
