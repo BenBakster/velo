@@ -266,10 +266,10 @@ the blank disk and walk the wizard:
    `Continue without verification = yes` answer-token; `m1-design.md` §4) — the
    modified medium's `SHA256.sig` is invalid by design (§3.3).
 4. hostname → e.g. `velo-test`.
-5. profile → run **`desktop`** for one pass and **`fortress`** for another (L3
+5. profile → run **`homely`** for one pass and **`fortress`** for another (L3
    needs fortress).
 6. packages → tick a few.
-7. start mode → **L1** with desktop, **L3** with fortress (the two that matter).
+7. start mode → **L1** with homely, **L3** with fortress (the two that matter).
 8. summary **Ворота-СТОП** → defaults to **No**; choose Yes and type the confirm
    word to proceed.
 
@@ -301,7 +301,7 @@ Now run the **acceptance matrix** on the booted system.
 | 3 | correct pf level loaded | `rcctl get pf` (or `pfctl -si \| grep Status`) ; `pfctl -sr` compared to `/etc/velo/pf/pf.lN.conf` for the chosen startmode | pf reports **Enabled** (status `Enabled`/`rcctl get pf` → `pf=YES`); the **loaded** ruleset (`pfctl -sr`) matches the chosen level file `pf.lN.conf` (install.site copied the right one). Note: install.site only copies the level file to `/etc/pf.conf`; it relies on the **stock `pf=YES` default** in `/etc/rc.conf` to load it at boot — confirm pf is actually Enabled, not just that the file is present. |
 | 4 | L3 ruleset (SOCKS-only, fail-closed) | `pfctl -nvf /etc/velo/pf/pf.l3.conf` | `block all` first; then exactly two `pass out quick … user _tor` (tcp, udp); **no** `rdr-to`/`divert-to` (this is SOCKS-only, not a transparent gateway) |
 | 5 | doas policy | **(a) syntax:** `doas -C /etc/doas.conf` (no command) ; **(b) permission match:** `doas -C /etc/doas.conf pkg_add -u` (as `anton`) | **(a)** prints **nothing** and exits **0** when the config is syntactically valid (non-zero + a parse error on bad syntax). **(b)** with a command, doas prints `permit`, `permit nopass`, or `deny` to stdout and exits 0 — it does **not** run the command. Pass = (a) silent/exit 0, and (b) shows the expected verdict with **no `permit nopass` (nopass) rule for `pkg_add`** (a nopass pkg rule would be the policy bug we are checking for). |
-| 6 | xenodm (desktop) | `rcctl get xenodm` ; `rcctl ls on` | enabled for the desktop profile; disabled for minimal/fortress per profile rule |
+| 6 | xenodm (homely) | `rcctl get xenodm` ; `rcctl ls on` | enabled for the homely profile; disabled for minimal/fortress per profile rule |
 | 7 | user idempotent | `id anton` | exists with `wheel operator`; install.site's group adjust did not dup/fail |
 | 8 | pkg offline closure | `PKG_PATH=/usr/obj/_pkgs pkg_add -n -l /etc/velo/installed.list` | resolves the **full** closure with `-n` (dry) from local blobs ONLY — no fetch |
 | 9 | packages present | `pkg_info \| sort` | the profile base ∪ chosen pkgs are installed (rc.firsttime ran) |
@@ -364,7 +364,7 @@ The hard test is matrix item 8 with `-n` **and the network blocked** (L3): it
 must resolve the entire closure from `/usr/obj/_pkgs` alone, with zero fetch
 attempts.
 
-Re-run the whole install for each profile/level that matters — **desktop+L1**
+Re-run the whole install for each profile/level that matters — **homely+L1**
 and **fortress+L3** at minimum.
 
 ### 5.4 legacy/MBR boot-mode acceptance (Backlog-C, ADDED С10)
