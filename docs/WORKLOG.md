@@ -475,3 +475,39 @@ item 7 не закрывался все прошлые сессии):**
 (User _tor + DataDirectory + hardening), `site/install.site.velo` (rc.local-инвариант + комменты под SOCKS),
 `tests/site-validate.ksh` (L3-ассерты переписаны под S: нет rdr/divert, pass out _tor, SafeSocks/ClientOnly,
 SOCKS не на 0.0.0.0, rc.local re-assert), `docs/m2-design.md`+`m3-design.md`+`m3-runbook.md` (L3-acceptance под
+SOCKS-only). *(Запись обрывается — артефакт реконструкции истории при аварии 2026-06-14.)*
+
+### Сессия — 2026-06-14 (post-recovery: восстановление покрытия + security-аудит установщика)
+**Контекст:** после аварии `git filter-repo` (см. `docs/RECOVERY-2026-06-14.md`) дерево
+восстановлено, но часть тестов из несохранённой Grok-сессии (homely-рефактор) потеряна
+(velo-install-test 235 vs 257, site-validate 119 vs 124). Эта сессия добивает пробел
+**по логике авторитетного `velo-install`** (извлечён из образа, точный), плюс ревью.
+
+**Сделано:**
+1. **Восстановлено homely-покрытие** (`tests/velo-install-test.ksh`): секция 12b —
+   unit-тесты `velo_profile_target_size_ok` (homely ≥28 GiB, граница, нечитаемый label,
+   bypass minimal/fortress); 12c — поведенческий гейт в `velo_execute` (цель <28 GiB
+   отклоняется до confirm/crypto).
+2. **Security-аудит `src/velo-install`** (read-only субагент). Найден 1 реальный баг:
+   Wi-Fi SSID валидировал `"`/`\`, но НЕ newline, а PSK — никак. Newline в SSID/PSK
+   расщеплял `answers`/`hostname.iwm0` (инъекция второй директивы). Остальное —
+   безопасно/by-design (guard-ordering чист, device-имена квотированы, секреты не текут).
+3. **Фикс:** добавлен `valid_wifi_value` (non-empty, no `"`/`\`/newline), применён к SSID
+   и PSK в `_wiz_wifi`. Вынесена чистая `velo_answers_body` (тело `answers` на stdout,
+   тестируемо) + write-site guard на `wifi_ssid` (закрывает env-preseed bypass).
+4. **check-pkg-closure**: +T10–T13 (compound/flavored stem `py3-gobject3-3.46.0p0`,
+   fail-closed на битом `+CONTENTS`, happy-path `--exact`). 11→16.
+5. **Дедуп:** удалены задвоенные реплеем блоки ассертов (scrub ×2; rc.local/torrc ×2).
+6. **Доки:** README (репо на GitHub, не «локальный»), HANDOFF/SESSION-PLAN/RECOVERY
+   (актуальные числа), Wi-Fi PSK долг помечен ЗАКРЫТЫМ (`hostname.iwm0` — чистый template).
+7. **terminal-профиль:** НЕ реализован (граница «не добавлять до Sprint-planing»
+   соблюдена) — написана дизайн-спека `docs/terminal-profile-proposal.md`.
+
+**Проверка (bash; oksh 64-бит — аналогично):** selftest 104 · velo-install-test **261** ·
+site-validate **115** · integrity 27 · check-pkg-closure **16**. Парсится bash+ksh.
+
+**Коммиты (push в ветку `claude/remote-phone-computer-access-68f68g`):** size-gate restore,
+dedup+README, wifi-фикс, доки, PSK-долг, terminal-proposal, answers_body, closure-tests.
+
+**Что осталось (нужно железо/KVM — НЕ в облаке):** homely VGA-приёмка кириллицы +
+supervised metal re-test на внешнем SSD.

@@ -114,6 +114,47 @@ make_pkg "$BROKEN" pkgB 2.0 pkgC-3.0   # C is declared but absent
 "$CHECK" "$BROKEN" >/dev/null 2>&1 && _rc9=0 || _rc9=$?
 t_eq "T9: broken transitive chain -> exit 1" 1 $_rc9
 
+# ---- T10: compound/flavored stem derivation (py3-gobject3-3.46.0p0) ---------
+# The trickiest path: the stem regex must strip the trailing -VERSION INCLUDING
+# the pNN flavor (-3.46.0p0) while KEEPING the multi-hyphen base, i.e.
+# py3-gobject3-3.46.0p0 -> py3-gobject3 (not py3, not py3-gobject3-3).  Provider
+# present at the exact flavored version, so BOTH stem and --exact must pass.
+FLAV=$(mktemp -d); trap 'rm -rf "$FLAV"' EXIT INT TERM
+_tmp=$(mktemp -d)
+printf '@name appB-1.0\n@depend x11/py3-gobject3:py3-gobject3-*:py3-gobject3-3.46.0p0\n' >"$_tmp/+CONTENTS"
+tar -czf "$FLAV/appB-1.0.tgz" -C "$_tmp" +CONTENTS
+rm -rf "$_tmp"
+make_pkg "$FLAV" py3-gobject3 3.46.0p0
+"$CHECK" "$FLAV" >/dev/null 2>&1; t_eq "T10: compound/flavored stem resolves -> exit 0" 0 $?
+"$CHECK" "$FLAV" --exact >/dev/null 2>&1; t_eq "T10: --exact matches flavored default -> exit 0" 0 $?
+
+# ---- T11: +CONTENTS with no @name -> fail-closed exit 1 --------------------
+NONAME=$(mktemp -d); trap 'rm -rf "$NONAME"' EXIT INT TERM
+_tmp=$(mktemp -d)
+printf '@comment no name record here\n@depend p:c:dep-1.0\n' >"$_tmp/+CONTENTS"
+tar -czf "$NONAME/bogus-1.0.tgz" -C "$_tmp" +CONTENTS
+rm -rf "$_tmp"
+"$CHECK" "$NONAME" >/dev/null 2>&1 && _rc11=0 || _rc11=$?
+t_eq "T11: +CONTENTS without @name -> exit 1" 1 $_rc11
+
+# ---- T12: @name with no derivable stem (no -VERSION) -> exit 1 -------------
+NOSTEM=$(mktemp -d); trap 'rm -rf "$NOSTEM"' EXIT INT TERM
+_tmp=$(mktemp -d)
+printf '@name nameless\n' >"$_tmp/+CONTENTS"
+tar -czf "$NOSTEM/nameless.tgz" -C "$_tmp" +CONTENTS
+rm -rf "$_tmp"
+"$CHECK" "$NOSTEM" >/dev/null 2>&1 && _rc12=0 || _rc12=$?
+t_eq "T12: @name without version (no stem) -> exit 1" 1 $_rc12
+
+# ---- T13: malformed @depend (empty third field) -> exit 1 -----------------
+BADDEP=$(mktemp -d); trap 'rm -rf "$BADDEP"' EXIT INT TERM
+_tmp=$(mktemp -d)
+printf '@name appC-1.0\n@depend pkgpath:constraint:\n' >"$_tmp/+CONTENTS"
+tar -czf "$BADDEP/appC-1.0.tgz" -C "$_tmp" +CONTENTS
+rm -rf "$_tmp"
+"$CHECK" "$BADDEP" >/dev/null 2>&1 && _rc13=0 || _rc13=$?
+t_eq "T13: malformed @depend (empty 3rd field) -> exit 1" 1 $_rc13
+
 # ---- summary ---------------------------------------------------------------
 echo ""
 total=$((pass + fail))
