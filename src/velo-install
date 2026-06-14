@@ -1096,6 +1096,29 @@ valid_wifi_value() {
 	return 0
 }
 
+# velo_answers_body -- emit the schema-1 answers contract (m2-design s2.3) on
+# stdout: the key=value lines install.site.velo reads to apply the operator's
+# profile/level.  PURE (no /mnt, no side effects), so it is unit-testable and
+# velo_execute just redirects it into /mnt/etc/velo/answers.  Defence-in-depth:
+# wifi_ssid is re-checked with valid_wifi_value HERE too -- the _wiz_wifi guard
+# only covers the interactive path, so an env-pre-seeded VELO_S_WIFI_SSID with an
+# embedded newline must not split this file (a bad/empty value collapses to the
+# blank "wifi_ssid=" line, never an injected directive).  The plaintext WPA PSK
+# is NEVER emitted here -- it goes only to hostname.iwm0.
+velo_answers_body() {
+	_putln "schema=1"
+	_putln "profile=$VELO_S_PROFILE"
+	_putln "startmode=$VELO_S_STARTMODE"
+	_putln "pkgs=$VELO_S_PKGS"
+	_putln "hostname=$VELO_S_HOSTNAME"
+	_putln "encrypt=$VELO_S_ENCRYPT"
+	if valid_wifi_value "$VELO_S_WIFI_SSID"; then
+		_putln "wifi_ssid=$VELO_S_WIFI_SSID"
+	else
+		_putln "wifi_ssid="
+	fi
+}
+
 # Returns 0 on confirm/skip, 1 on ESC/back.  Optional screen: blank SSID skips
 # Wi-Fi setup entirely (the template hostname.iwm0 ships without credentials).
 # When SSID is provided, PSK is required; both are written directly to
@@ -1624,15 +1647,7 @@ velo_execute() {
 	if mount "/dev/${VELO_S_ROOTDISK}a" /mnt 2>/dev/null || mount | grep -q " on /mnt "; then
 		velo_mount_target_partitions "$VELO_S_ROOTDISK"
 		mkdir -p /mnt/etc/velo 2>/dev/null
-		{
-			_putln "schema=1"
-			_putln "profile=$VELO_S_PROFILE"
-			_putln "startmode=$VELO_S_STARTMODE"
-			_putln "pkgs=$VELO_S_PKGS"
-			_putln "hostname=$VELO_S_HOSTNAME"
-			_putln "encrypt=$VELO_S_ENCRYPT"
-			_putln "wifi_ssid=$VELO_S_WIFI_SSID"
-		} >/mnt/etc/velo/answers 2>/dev/null
+		velo_answers_body >/mnt/etc/velo/answers 2>/dev/null
 		chmod 0600 /mnt/etc/velo/answers 2>/dev/null || true
 		# Verify the answers contract actually landed -- a silent write failure
 		# would make install.site.velo fall back to the safe floor (minimal+L1),

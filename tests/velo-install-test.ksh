@@ -303,6 +303,44 @@ t_has   "fortress set-mask: games out"  "$CONF_FORT_SETS" "-game*"
 VELO_S_PROFILE="homely"
 
 # ===========================================================================
+#  6d. velo_answers_body -- the schema-1 answers contract (m2-design s2.3).
+#      PURE (stdout only); velo_execute redirects it into /mnt/etc/velo/answers.
+#      Must carry profile/startmode/pkgs/hostname/encrypt, must re-validate
+#      wifi_ssid (defence-in-depth vs env-pre-seed bypassing the _wiz_wifi
+#      guard), and must NEVER emit the plaintext WPA PSK (that goes only to
+#      hostname.iwm0).
+# ===========================================================================
+VELO_S_PROFILE="homely"; VELO_S_STARTMODE="L2"; VELO_S_PKGS="git tmux"
+VELO_S_HOSTNAME="velo-bsd"; VELO_S_ENCRYPT="yes"
+VELO_S_WIFI_SSID="home-net"; VELO_S_WIFI_PSK="TOPSECRET-WIFI-PSK-DO-NOT-LEAK"
+AB=$(velo_answers_body)
+t_has  "answers schema line"        "$AB" "schema=1"
+t_has  "answers profile line"       "$AB" "profile=homely"
+t_has  "answers startmode line"     "$AB" "startmode=L2"
+t_has  "answers pkgs line"          "$AB" "pkgs=git tmux"
+t_has  "answers hostname line"      "$AB" "hostname=velo-bsd"
+t_has  "answers encrypt line"       "$AB" "encrypt=yes"
+t_has  "answers wifi_ssid line"     "$AB" "wifi_ssid=home-net"
+t_hasnt "answers NEVER carries PSK"  "$AB" "TOPSECRET-WIFI-PSK-DO-NOT-LEAK"
+t_hasnt "answers carries no wifi_psk key" "$AB" "wifi_psk"
+# empty SSID -> blank "wifi_ssid=" line (the common "skip Wi-Fi" case); the key
+# stays present so install.site.velo parses a complete contract.
+VELO_S_WIFI_SSID=""
+AB_NOSSID=$(velo_answers_body)
+t_has  "answers blank wifi_ssid when skipped" "$AB_NOSSID" "wifi_ssid="
+# DEFENCE-IN-DEPTH: a hostile SSID carrying a newline (env-pre-seeded, never
+# through the _wiz_wifi guard) must NOT split the file into a second directive --
+# the write-site valid_wifi_value collapses it to the blank wifi_ssid= line.
+_AB_INJ='home
+allow_root_login=yes'
+VELO_S_WIFI_SSID="$_AB_INJ"
+AB_INJ=$(velo_answers_body)
+t_hasnt "answers drops newline-injected SSID payload" "$AB_INJ" "allow_root_login=yes"
+t_has   "answers sanitises bad SSID to blank line"    "$AB_INJ" "wifi_ssid="
+VELO_S_WIFI_SSID=""; VELO_S_WIFI_PSK=""; VELO_S_PKGS=""
+VELO_S_PROFILE="homely"
+
+# ===========================================================================
 #  7. gen_install_conf output (encrypt=yes -> crypto placeholder)
 # ===========================================================================
 VELO_S_ENCRYPT="yes"; VELO_S_ROOTDISK="sdN"
