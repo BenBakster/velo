@@ -116,7 +116,10 @@
   (зафиксировать узкую сильную роль «безопасный установщик зашифрованного OpenBSD»). Архив и
   SATYR-gateway-профиль отклонены на этой развилке.
 - **Долги качества (из ревизии 2026-06-11, `docs/review-codex-2026-06-11.md` + аудит):**
-  Остался только Wi-Fi PSK в репо (пункт 1, отложен Антоном). **Build-цепочка целостности ЗАКРЫТА**
+  **Wi-Fi PSK долг ЗАКРЫТ** 2026-06-14: `site/etc/hostname.iwm0` — чистый template
+  (ни `join`, ни `wpakey` в активных строках; repo-grep на `wpakey`/PSK чист),
+  реальные креды пишутся только install-time из мастера; добавлена install-time
+  валидация `valid_wifi_value` (newline/quote line-injection закрыт). **Build-цепочка целостности ЗАКРЫТА**
   2026-06-11: signify-сверка firmware (`openbsd-79-fw.pub`, закрыт plain-HTTP MITM) + `.sha256`-сайдкары
   образа (assemble/grow эмитят, write-usb/flash-sda сверяют до `dd`) + `build/lib-integrity.sh` +
   `tests/integrity-test.ksh` 27/27. Надёжность installer-а ЗАКРЫТА: pre-flight до destroy-gate +
