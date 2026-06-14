@@ -1,0 +1,8 @@
+# velo build artifacts -- not committed (reproducible from site/ via build/).
+/dist/
+# VM disks / serial logs for the M3 build-host (Этап 1+) -- throwaway, never committed.
+/vm/
+# offline pkg closure blobs (populated in the VM at Этап 4; large, reproducible from .list).
+# Lives on /usr/obj (largest auto-layout partition) so it fits without touching the
+# disk layout the softraid FDE boot depends on (см. Сессия 7 в docs/WORKLOG.md).
+site/usr/obj/_pkgs/*.tgz

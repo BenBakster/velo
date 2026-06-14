@@ -1,0 +1,3 @@
+# velo homely -- keyboard layouts (us/ua/ru), toggle Shift+Alt
+VELO_XKB_LAYOUTS="us,ua,ru"
+VELO_XKB_TOGGLE="grp:shift_alt_toggle"

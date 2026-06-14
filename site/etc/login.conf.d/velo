@@ -1,0 +1,11 @@
+# /etc/login.conf.d/velo -- velo login class (umask/limits).
+# A drop-in login class; assign a user to it with `usermod -L velo <user>` or
+# reference it from /etc/login.conf.  Conservative hardening defaults.
+velo:\
+	:umask=077:\
+	:datasize-max=infinity:\
+	:maxproc-max=1024:\
+	:maxproc-cur=512:\
+	:openfiles-max=4096:\
+	:openfiles-cur=1024:\
+	:tc=default:

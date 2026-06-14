@@ -1,0 +1,11 @@
+#!/bin/sh
+# /etc/X11/xenodm/Xsetup_0 -- velo homely login-screen setup (optional tweak).
+# Shipped in the static set; install.site KEEPS this only when profile=homely
+# and PRUNES it otherwise.  Runs as root before the xenodm greeter appears.
+# STATIC-authored -- verify xenodm picks it up in the 7.9 VM (M3).
+
+# Blank background to a solid colour (no default bitmap); harmless if xsetroot
+# is absent on a minimal X.
+if command -v xsetroot >/dev/null 2>&1; then
+	xsetroot -solid '#1d2021'
+fi

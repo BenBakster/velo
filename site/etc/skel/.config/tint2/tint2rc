@@ -1,0 +1,41 @@
+# velo homely -- tint2 panel (taskbar + tray + clock), SATYR dark theme
+
+rounded = 0
+border_width = 0
+background_color = #1d2021 100
+border_color = #1d2021 0
+
+rounded = 0
+border_width = 0
+background_color = #3c3836 100
+border_color = #83a598 100
+
+panel_items = TSC
+panel_size = 100% 30
+panel_margin = 0 0
+panel_padding = 4 2 4
+panel_position = bottom center horizontal
+panel_background_id = 1
+panel_monitor = all
+wm_menu = 1
+
+taskbar_mode = single_desktop
+taskbar_padding = 4 0 4
+task_text = 1
+task_icon = 1
+task_maxsize = 240 30
+task_padding = 4 2
+task_font = sans 10
+task_font_color = #ebdbb2 100
+task_active_background_id = 2
+
+systray_padding = 4 2 4
+systray_background_id = 0
+systray_icon_size = 22
+systray_icon_asb = 100 0 0
+
+time1_format = %a %d %b  %H:%M
+time1_font = sans 10
+clock_font_color = #ebdbb2 100
+clock_padding = 8 0
+clock_background_id = 0

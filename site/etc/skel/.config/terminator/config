@@ -1,0 +1,31 @@
+# velo homely -- terminator defaults (UTF-8 / Cyrillic via locale + noto-fonts)
+[profiles]
+  [[default]]
+    use_system_font = False
+    font = DejaVu Sans Mono 11
+    scrollback_lines = 8192
+    background_color = "#1d2021"
+    foreground_color = "#ebdbb2"
+    cursor_color = "#ebdbb2"
+    copy_on_selection = True
+    scrollbar_position = hidden
+[global_config]
+  focus = system
+  keybindings = default
+[layouts]
+  [[default]]
+    [[[window0]]]
+      type = Window
+      parent = ""
+    [[[child1]]]
+      type = Terminal
+      parent = window0
+      profile = default
+    [[[window0]]]
+      type = Window
+      parent = ""
+    [[[child1]]]
+      type = Terminal
+      parent = window0
+      profile = default
+[plugins]

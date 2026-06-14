@@ -1,0 +1,4 @@
+# Wi-Fi credentials are written here by velo-install at installation time.
+# If velo-install was run without a Wi-Fi SSID (skipped), add manually:
+#   join "your-network" wpakey "your-passphrase"
+dhcp

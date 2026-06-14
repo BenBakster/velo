@@ -1,0 +1,33 @@
+# build/dot.profile.hook -- reference snippet showing EXACTLY what build-velo
+# splices into the ramdisk /.profile, and WHERE.
+#
+# build-velo.sh does NOT append this after the stock dot.profile's closing 'fi'
+# (that would run only after the operator has already left the menu, too late to
+# wrap it).  Instead it INSERTS the two load-bearing lines on the line ABOVE the
+# stock interactive menu loop, anchored on the loop header `while :; do`.
+#
+# The marker line below is the idempotency sentinel; build-velo re-runs are
+# no-ops once it is present.
+#
+#   ANCHOR: `while :; do`  -- the header of the installer's choice loop in the
+#   stock 7.9 dot.profile ($OpenBSD: dot.profile,v 1.52).  It is the one
+#   structurally invariant feature of the menu across releases (the prompt
+#   wording and case arms churn; the `while :; do ... read REPLY ... done` loop
+#   does not).  Inserting above it makes velo run FIRST; on ESC/cancel/non-tty
+#   the hook RETURNS and the stock loop's first `read REPLY` still offers
+#   (I)/(U)/(A)/(S).
+#
+# Spliced result (the velo lines sit immediately above the stock loop):
+#
+#       # --- velo hook (injected by build-velo) ---
+#       . /velo-rd-hook.sh
+#
+#       while :; do
+#               read REPLY?'(I)nstall, (U)pgrade, (A)utoinstall or (S)hell? '
+#               ...
+#       done
+#
+# The two lines build-velo actually inserts (the sentinel marker + the source):
+
+# --- velo hook (injected by build-velo) ---
+. /velo-rd-hook.sh

@@ -1,0 +1,591 @@
+#!/bin/sh
+# /install.site -- velo OpenBSD 7.9 chroot post-install hook (M2).
+#
+# WHERE THIS RUNS:
+#   The stock installer extracts site79.tgz LAST into the new root, then runs
+#   /install.site CHROOTED at the freshly installed system, with NO network.
+#   (docs/constraints.md s6; install.site(5).)  So every path below is the
+#   TARGET's path (e.g. /etc/pf.conf == the new system's /etc/pf.conf), and
+#   nothing here may fetch from a mirror.
+#
+# TARGET SHELL:
+#   The new system's /bin/sh (OpenBSD ksh).  POSIX-portable; no bashisms, no
+#   GNU-only flags.  Validates clean under `sh -n`, `bash -n`, and oksh `-n`.
+#
+# WHAT IT DOES (ordered; see docs/m2-design.md s5):
+#   1. PARSE /etc/velo/answers (KEY=value data, never sourced as code) on top of
+#      the safe floor minimal+L1, then re-validate.
+#   2. install the level pf.conf for $startmode -> /etc/pf.conf.
+#   3. append the level sysctl deltas to /etc/sysctl.conf (sentinel-guarded).
+#   4. tighten /etc/doas.conf perms.
+#   5. adjust the installer-created user's groups (idempotent; no create).
+#   6. enable/disable xenodm per profile (rcctl).
+#   7. prune profile/level-specific members that do not apply.
+#   8. compose the offline pkg list (profile base UNION validated pkgs) ->
+#      /etc/velo/installed.list (kept OUT of the closure dir so PKG_PATH = pure blobs).
+#   9. APPEND (never clobber, sentinel-guarded) the offline pkg_add block to
+#      /etc/rc.firsttime.  PKG_PATH branches on startmode (see step 9 below):
+#      L1/L2 -> /usr/obj/_pkgs:installpath (local-then-mirror, network open);
+#      L3    -> /usr/obj/_pkgs ONLY (fail-closed pf is loaded by /etc/rc BEFORE
+#      rc.firsttime, so the mirror is unreachable; the offline closure MUST be
+#      complete).  pkg_add failure is logged LOUDLY -- no silent partial install.
+#      On SUCCESS the one-shot closure is reclaimed (rm -rf) to free 136 MiB..~1 GiB.
+#  10. cleanup + log.
+#
+# SAFETY POSTURE:
+#   - install.site itself does NO network access (no ftp/http here).  It only
+#     DEFERS pkg_add to /etc/rc.firsttime, which runs on first boot.  At L1/L2
+#     that deferred pkg_add MAY fall back to the installer mirror; at L3 it is
+#     LOCAL-ONLY because the fail-closed firewall blocks the mirror.
+#   - Every variable quoted.  Answers file is re-validated token-by-token after
+#     PARSING -- the file is data, never sourced/executed; NEVER trusted even
+#     though the TUI wrote it.
+#   - Idempotent: safe to re-run; group/file adjusts never double-create, and the
+#     two >> appends (sysctl deltas, rc.firsttime block) are sentinel-guarded so
+#     a re-run cannot double-append.
+#   - Appends to /etc/rc.firsttime and /etc/sysctl.conf with >> (never >).
+#
+# TESTABILITY (does NOT change production behaviour):
+#   - All filesystem paths are written via "${VELO_ROOT}<abspath>". VELO_ROOT is
+#     EMPTY by default, so in the real chroot every path is the plain absolute
+#     path (e.g. /etc/pf.conf). The M2 validator sets VELO_ROOT to a temp dir to
+#     run a fakeroot dry-run WITHOUT touching the real system.
+#   - VELO_DRYRUN=1 (set only by the validator) skips the commands that cannot be
+#     sandboxed by a path prefix -- rcctl, usermod, id. In production VELO_DRYRUN
+#     is unset, so those always run.
+#
+# STATIC-ONLY on the Void build host (pfctl/doas -C/rcctl/pkg_add absent there):
+#   steps 2/4/6/9 are authored + parse-checked here and FLAGGED
+#   `verify in the 7.9 VM (M3)`.
+
+set -u
+
+# Relocatable root prefix (EMPTY in production -> plain absolute paths).
+VELO_ROOT="${VELO_ROOT:-}"
+# Dry-run flag (set only by the M2 validator; unset in production).
+VELO_DRYRUN="${VELO_DRYRUN:-}"
+
+VELO_LOG="${VELO_ROOT}/var/log/velo-install.site.log"
+
+# log MSG -- to console AND the persistent log (best-effort; never fail the run).
+log() {
+	echo "velo: $*"
+	echo "velo: $*" >>"$VELO_LOG" 2>/dev/null || true
+}
+
+# Ensure the log dir exists (matters under VELO_ROOT; /var/log already exists in
+# the real chroot, so this is a harmless mkdir -p there).
+mkdir -p "${VELO_ROOT}/var/log" 2>/dev/null || true
+
+log "install.site start (root='${VELO_ROOT:-/}' dryrun='${VELO_DRYRUN:-no}')"
+
+# ---------------------------------------------------------------------------
+# 1. Safe floor, then PARSE (do NOT source) + re-validate the answers file.
+#    The floor is set FIRST so a missing/garbage file yields minimal + L1 + no
+#    optional pkgs (docs/m2-design.md s2.2).
+#
+#    SECURITY -- WHY WE PARSE INSTEAD OF `. answers`:
+#      `. /etc/velo/answers` would EXECUTE any `$(...)`, `;cmd`, or `|cmd` in a
+#      value at SOURCE TIME, before any re-validation can help -- e.g. a line
+#      `pkgs=a $(touch /pwned)` runs `touch` when sourced.  That violates the
+#      doctrine "never trust the file even though the TUI wrote it"
+#      (m2-design.md s2.1) and the M2 validation requirement that
+#      `profile=desktop; rm -rf /` / `pkgs=a;b` must NOT execute (s8.4).
+#      So we read KEY=value lines ourselves, split on the FIRST '=', and assign
+#      only whitelisted keys -- the value is data, never code.
+# ---------------------------------------------------------------------------
+profile=minimal
+startmode=L1
+pkgs=""
+hostname=""
+encrypt=no
+schema=1
+wifi_ssid=""
+
+_answers="${VELO_ROOT}/etc/velo/answers"
+if [ -r "$_answers" ]; then
+	while IFS= read -r _aline; do
+		# skip blanks and comments
+		case "$_aline" in
+		""|"#"*) continue ;;
+		esac
+		# must contain '='; split on the FIRST '='
+		case "$_aline" in
+		*=*) : ;;
+		*) continue ;;
+		esac
+		_akey=${_aline%%=*}
+		_aval=${_aline#*=}
+		# Strip a trailing CR so a CRLF (DOS) answers file cannot smuggle a '\r'
+		# into the value: e.g. "startmode=L3\r" would otherwise fail the
+		# L1|L2|L3 whitelist and silently demote the box to the minimal+L1 floor.
+		# Use a literal CR (built without echo -e / printf %b so it is portable
+		# across sh/oksh/bash) and strip one trailing occurrence.
+		_acr=$(printf '\r')
+		_aval=${_aval%"$_acr"}
+		# also strip a trailing CR from the key (CRLF before '=' is unusual but
+		# would break the key whitelist match the same way).
+		_akey=${_akey%"$_acr"}
+		# assign ONLY known keys; the value is plain data (no eval, no source).
+		case "$_akey" in
+		schema)    schema=$_aval ;;
+		profile)   profile=$_aval ;;
+		startmode) startmode=$_aval ;;
+		pkgs)      pkgs=$_aval ;;
+		hostname)  hostname=$_aval ;;
+		encrypt)   encrypt=$_aval ;;
+		wifi_ssid) wifi_ssid=$_aval ;;
+		*) log "WARN ignoring unknown answers key '$_akey'" ;;
+		esac
+	done <"$_answers"
+	log "parsed $_answers (no sourcing -- values treated as data)"
+else
+	log "no answers file -- using safe floor minimal+L1, no extra pkgs"
+fi
+
+# Re-validate against the SAME whitelists the TUI uses; bad value -> floor.
+case "$schema" in
+1) : ;;
+*) log "WARN unknown answers schema='$schema' (expected 1); continuing" ;;
+esac
+
+case "$profile" in
+minimal|homely|fortress) : ;;
+*) log "WARN invalid profile='$profile' -> minimal"; profile=minimal ;;
+esac
+
+case "$startmode" in
+L1|L2|L3) : ;;
+*) log "WARN invalid startmode='$startmode' -> L1"; startmode=L1 ;;
+esac
+
+case "$encrypt" in
+yes|no) : ;;
+*) encrypt=no ;;
+esac
+
+# Map startmode (L1/L2/L3) -> lowercase file tag (l1/l2/l3) WITHOUT tr.
+case "$startmode" in
+L1) lvl=l1 ;;
+L2) lvl=l2 ;;
+L3) lvl=l3 ;;
+esac
+
+log "resolved: profile=$profile startmode=$startmode (lvl=$lvl) encrypt=$encrypt"
+
+# ---------------------------------------------------------------------------
+# 2. Firewall -- install the level pf.conf.
+#    The static set ships all three under /etc/velo/pf/; copy the chosen one to
+#    /etc/pf.conf.  pf is enabled by default on OpenBSD; we just place the rules.
+#    STATIC-only here; `pfctl -nf` -> verify in the 7.9 VM (M3).
+# ---------------------------------------------------------------------------
+_pf_src="${VELO_ROOT}/etc/velo/pf/pf.${lvl}.conf"
+if [ -f "$_pf_src" ]; then
+	cp "$_pf_src" "${VELO_ROOT}/etc/pf.conf"
+	chmod 0600 "${VELO_ROOT}/etc/pf.conf"
+	log "installed pf.conf from /etc/velo/pf/pf.${lvl}.conf (verify pfctl -nf in M3)"
+else
+	log "WARN $_pf_src missing -- leaving stock /etc/pf.conf in place"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. sysctl -- APPEND the level deltas onto the shipped base /etc/sysctl.conf.
+#    Append (>>), never overwrite, so base hardening + level deltas compose.
+# ---------------------------------------------------------------------------
+_sysctl_src="${VELO_ROOT}/etc/velo/sysctl/sysctl.${lvl}.conf"
+_sysctl_dst="${VELO_ROOT}/etc/sysctl.conf"
+# Idempotency sentinel: a unique marker line that the append writes.  A re-run
+# greps for it first and skips, so the block can NEVER be double-appended.
+_sysctl_marker="# --- velo: ${startmode} sysctl deltas (appended by install.site) ---"
+if [ -f "$_sysctl_src" ]; then
+	if grep -qxF -- "$_sysctl_marker" "$_sysctl_dst" 2>/dev/null; then
+		log "sysctl ${startmode} deltas already present in /etc/sysctl.conf -- skipping (idempotent re-run)"
+	else
+		{
+			echo ""
+			echo "$_sysctl_marker"
+			cat "$_sysctl_src"
+		} >>"$_sysctl_dst"
+		log "appended sysctl.${lvl}.conf to /etc/sysctl.conf"
+	fi
+else
+	log "WARN $_sysctl_src missing -- /etc/sysctl.conf base only"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. doas -- tighten perms.  doas refuses a group/other-writable doas.conf.
+#    STATIC-only here; `doas -C /etc/doas.conf` -> verify in the 7.9 VM (M3).
+# ---------------------------------------------------------------------------
+if [ -f "${VELO_ROOT}/etc/doas.conf" ]; then
+	chown root:wheel "${VELO_ROOT}/etc/doas.conf" 2>/dev/null || true
+	chmod 0600 "${VELO_ROOT}/etc/doas.conf"
+	log "set /etc/doas.conf root:wheel 0600 (verify doas -C in M3)"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. User -- adjust the installer-created user's groups (idempotent).
+#    DECISION (docs/m2-design.md s5.5): install.conf creates `anon` via
+#    `Setup a user = anon`; install.site only ADJUSTS groups, never creates,
+#    to avoid a double-create.  Guarded by VELO_DRYRUN (id/usermod touch the
+#    real passwd db, which a path prefix cannot sandbox).  MUST match the
+#    `Setup a user =` line gen_install_conf emits in src/velo-install.
+# ---------------------------------------------------------------------------
+VELO_USER=anon
+if [ -n "$VELO_DRYRUN" ]; then
+	log "DRYRUN: skipping id/usermod for $VELO_USER (verify in M3)"
+elif id "$VELO_USER" >/dev/null 2>&1; then
+	usermod -G wheel,operator "$VELO_USER" 2>/dev/null \
+		&& log "adjusted groups for $VELO_USER (wheel,operator)" \
+		|| log "WARN could not usermod $VELO_USER (verify in M3)"
+else
+	log "WARN user $VELO_USER not present at site time (expected from install.conf); skipping group adjust"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Display manager -- xenodm only for the homely profile.
+#    rcctl edits the real /etc/rc.conf.local; guarded by VELO_DRYRUN.
+#    STATIC-only here; `rcctl enable/disable xenodm` -> verify in 7.9 VM (M3).
+# ---------------------------------------------------------------------------
+if [ -n "$VELO_DRYRUN" ]; then
+	if [ "$profile" = "homely" ]; then
+		log "DRYRUN: would 'rcctl enable xenodm' (homely)"
+	else
+		log "DRYRUN: would 'rcctl disable xenodm' (profile=$profile)"
+	fi
+elif [ "$profile" = "homely" ]; then
+	rcctl enable xenodm 2>/dev/null \
+		&& log "enabled xenodm (homely)" \
+		|| log "WARN rcctl enable xenodm failed/absent (verify in M3)"
+else
+	rcctl disable xenodm 2>/dev/null \
+		&& log "disabled xenodm (profile=$profile, no DM)" \
+		|| log "note: rcctl disable xenodm noop/absent (verify in M3)"
+fi
+
+# ---------------------------------------------------------------------------
+# 6b. Homely session -- deliver dotfiles so xenodm launches openbox+tint2, not
+#     the stock fallback (fvwm/twm).  /etc/skel alone is NOT enough: the installer
+#     copies /etc/skel at user-create time, which runs BEFORE site79.tgz unpacks
+#     our skel, so the already-created user never sees it.  Copy into the user's
+#     home explicitly (homely only), without clobbering hand-edited files.
+#     Guarded by VELO_DRYRUN (writes a real home dir a path prefix cannot sandbox
+#     for chown).  The skel master ships via site79.tgz and is pruned for non-
+#     homely profiles in step 7 below.
+# ---------------------------------------------------------------------------
+velo_install_skel_file() {
+	_skel="$1"
+	_home="$2"
+	_src="${VELO_ROOT}/etc/skel/${_skel}"
+	_dst="${VELO_ROOT}/home/${VELO_USER}/${_home}"
+	if [ ! -f "$_src" ]; then
+		log "WARN /etc/skel/$_skel missing -- homely dotfile not wired"
+		return 0
+	fi
+	# useradd copies /etc/skel BEFORE site79.tgz unpacks our homely skel, so the
+	# home dir often carries stock stubs.  Always lay down velo homely files.
+	mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
+	if cp -f "$_src" "$_dst" 2>/dev/null; then
+		chown "$VELO_USER" "$_dst" 2>/dev/null || true
+		case "$_dst" in
+		*/.xsession) chmod 0755 "$_dst" 2>/dev/null || true ;;
+		*) chmod 0644 "$_dst" 2>/dev/null || true ;;
+		esac
+		log "installed ~$VELO_USER/$_home"
+	else
+		log "WARN could not install ~$VELO_USER/$_home (verify in M3)"
+	fi
+}
+
+velo_install_skel_tree() {
+	_skeldir="$1"
+	_homedir="$2"
+	_src="${VELO_ROOT}/etc/skel/${_skeldir}"
+	_dst="${VELO_ROOT}/home/${VELO_USER}/${_homedir}"
+	if [ ! -d "$_src" ]; then
+		log "WARN /etc/skel/$_skeldir missing -- homely config tree not wired"
+		return 0
+	fi
+	mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
+	rm -rf "$_dst" 2>/dev/null || true
+	if cp -R "$_src" "$_dst" 2>/dev/null; then
+		chown -R "$VELO_USER" "$_dst" 2>/dev/null || true
+		log "installed ~$VELO_USER/$_homedir/"
+	else
+		log "WARN could not install ~$VELO_USER/$_homedir/ (verify in M3)"
+	fi
+}
+
+if [ "$profile" = "homely" ]; then
+	if [ -n "$VELO_DRYRUN" ]; then
+		log "DRYRUN: would install homely dotfiles for $VELO_USER (.xsession, .Xdefaults, .config/*)"
+	else
+		# useradd records /home/$VELO_USER but may not create the directory before
+		# site79.tgz lands; lay it down explicitly so cp has a real target.
+		mkdir -p "${VELO_ROOT}/home/${VELO_USER}" 2>/dev/null || true
+		chown "${VELO_USER}" "${VELO_ROOT}/home/${VELO_USER}" 2>/dev/null \
+			|| log "WARN could not chown /home/$VELO_USER (verify in M3)"
+		chmod 0750 "${VELO_ROOT}/home/${VELO_USER}" 2>/dev/null || true
+		velo_install_skel_file ".profile" ".profile"
+		velo_install_skel_file ".kshrc" ".kshrc"
+		velo_install_skel_file ".xsession" ".xsession"
+		velo_install_skel_file ".Xdefaults" ".Xdefaults"
+		velo_install_skel_file ".velo-xkb" ".velo-xkb"
+		velo_install_skel_tree ".config/openbox" ".config/openbox"
+		velo_install_skel_tree ".config/tint2" ".config/tint2"
+		velo_install_skel_tree ".config/terminator" ".config/terminator"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Profile / level pruning -- drop members that do not apply, so the booted
+#    system carries only what its profile/level uses.  Shipping-then-pruning
+#    keeps ONE static blob.
+# ---------------------------------------------------------------------------
+# Tor torrc only needed when startmode=L3 (the L3 pf routes all egress via Tor SOCKS).
+if [ "$startmode" != "L3" ]; then
+	rm -f "${VELO_ROOT}/etc/tor/torrc"
+	rmdir "${VELO_ROOT}/etc/tor" 2>/dev/null || true
+	log "pruned /etc/tor/torrc (startmode=$startmode != L3)"
+fi
+# xenodm Xsetup tweak + homely skel dotfiles only for homely.
+if [ "$profile" != "homely" ]; then
+	rm -f "${VELO_ROOT}/etc/X11/xenodm/Xsetup_0"
+	log "pruned /etc/X11/xenodm/Xsetup_0 (profile=$profile != homely)"
+	rm -f "${VELO_ROOT}/etc/skel/.xsession" \
+		"${VELO_ROOT}/etc/skel/.Xdefaults" \
+		"${VELO_ROOT}/etc/skel/.velo-xkb"
+	rm -rf "${VELO_ROOT}/etc/skel/.config"
+	log "pruned /etc/skel homely dotfiles (profile=$profile != homely)"
+	rm -f "${VELO_ROOT}/etc/hostname.iwm0" "${VELO_ROOT}/etc/hostname.em0"
+	log "pruned hostname.iwm0/em0 (profile=$profile != homely)"
+fi
+# Auto-joining WiFi/wired (clearnet DHCP + DNS) would leak OUTSIDE Tor at L3,
+# where pf.l3.conf is fail-closed (block all; only _tor egresses).  L3 is
+# reachable WITH the homely profile (profile/startmode are orthogonal), so this
+# prune is mandatory and independent of the homely gate above.
+if [ "$startmode" = "L3" ]; then
+	rm -f "${VELO_ROOT}/etc/hostname.iwm0" "${VELO_ROOT}/etc/hostname.em0"
+	log "pruned hostname.iwm0/em0 (startmode=L3 fail-closed: no clearnet auto-join)"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Compose the offline pkg list = profile base UNION validated `pkgs`.
+#    Each token re-validated ^[A-Za-z0-9._+-]+$ (also the injection gate: a
+#    package name can never carry a shell metachar).  De-duplicated, one/line.
+# ---------------------------------------------------------------------------
+_base_list="${VELO_ROOT}/usr/obj/_pkgs/${profile}.list"
+# The composed list lives OUTSIDE the closure dir so that dir stays PURE package
+# blobs (*.tgz) -- pkg_add -l reads a name list, which is metadata, not a
+# package, and must not pollute the PKG_PATH directory.
+_final_list="${VELO_ROOT}/etc/velo/installed.list"
+
+# velo_token_ok TOKEN -- 0 if it matches the package-name charset, else 1.
+velo_token_ok() {
+	case "$1" in
+	"") return 1 ;;
+	*[!A-Za-z0-9._+-]*) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
+# Ensure the dirs exist (under VELO_ROOT during dry-run; they already exist in
+# the real chroot -- /usr/obj/_pkgs from the extracted site set, /etc/velo from
+# the answers drop).  /etc/velo holds the composed installed.list; the closure
+# dir stays pure package blobs.
+mkdir -p "${VELO_ROOT}/usr/obj/_pkgs" "${VELO_ROOT}/etc/velo" 2>/dev/null || true
+
+# Start the final list empty; collect base list lines, then the validated pkgs.
+: >"$_final_list"
+
+# velo_add_token TOKEN -- append if valid + not already in $_final_list.
+velo_add_token() {
+	_t=$1
+	velo_token_ok "$_t" || { log "DROP invalid pkg token '$_t'"; return 0; }
+	# dedupe: exact-line LITERAL match against what we've written so far.
+	# -F (fixed string) is required because package names contain '.' and '+'
+	# (e.g. py3-foo, libstdc++) which grep would otherwise treat as regex
+	# metacharacters, risking a false "already present" and a dropped package.
+	if grep -qxF -- "$_t" "$_final_list" 2>/dev/null; then
+		return 0
+	fi
+	echo "$_t" >>"$_final_list"
+}
+
+# 8a. profile mandatory base (one token per line in the .list).
+if [ -f "$_base_list" ]; then
+	while IFS= read -r _line; do
+		case "$_line" in
+		""|"#"*) continue ;;
+		esac
+		velo_add_token "$_line"
+	done <"$_base_list"
+	log "composed base packages from /usr/obj/_pkgs/${profile}.list"
+else
+	log "WARN $_base_list missing -- no profile base packages"
+fi
+
+# 8b. operator opt-ins from answers `pkgs` (space-separated). Word-split on IFS.
+#     Unquoted expansion is intentional here; each token is charset-validated.
+# shellcheck disable=SC2086
+for _p in $pkgs; do
+	velo_add_token "$_p"
+done
+
+# 8c. L3 safety: if startmode=L3 but the base lacks tor, ADD tor/torsocks (else
+#     the box bricks on first boot with no route out -- L3 pf is fail-closed and
+#     only _tor may egress). docs/m2-design.md s6 L3.
+if [ "$startmode" = "L3" ]; then
+	velo_add_token tor
+	velo_add_token torsocks
+	log "L3: ensured tor/torsocks in pkg list (fail-closed needs Tor)"
+fi
+
+log "final offline pkg list written to /etc/velo/installed.list (PKG_PATH stays pure blobs)"
+
+# ---------------------------------------------------------------------------
+# 9. APPEND the offline pkg_add block to /etc/rc.firsttime (runs FIRST BOOT).
+#    Append with >> -- rc.firsttime may already carry installer-generated lines;
+#    never clobber them (docs/constraints.md s6).
+#
+#    ORDERING THAT MAKES THIS CORRECT (and why the L3 closure MUST be complete):
+#      /etc/rc loads /etc/pf.conf (rcctl pf=YES) BEFORE it runs rc.firsttime.
+#      So by the time this block executes, the level firewall is ALREADY active.
+#      - L1/L2: pf permits outbound, so the network is reachable.  PKG_PATH can be
+#        the local dir THEN the installer mirror as a fallback -- if the bundled
+#        offline closure is missing a dependency, pkg_add can still fetch it.
+#      - L3: the firewall is FAIL-CLOSED (block all; only the _tor user egresses,
+#        every other program must go through Tor's SOCKS 127.0.0.1:9050).
+#        rc.firsttime runs as root, NOT as _tor, so it has NO route to any mirror
+#        -- the mirror is UNREACHABLE.
+#        Therefore at L3 the offline closure under /usr/obj/_pkgs MUST be COMPLETE and
+#        the PKG_PATH MUST be the LOCAL dir ONLY (a mirror entry would just make
+#        pkg_add hang/timeout against a blocked route).  This is enforced below by
+#        the `if [ "$startmode" = "L3" ]` guard; the L3 *.tgz closure completeness
+#        is the M3-VM gate (docs/m2-design.md s8).
+#
+#    PKG_PATH HONESTY: we therefore do NOT promise a network fallback at L3.
+#    L1/L2 get local-then-mirror; L3 gets local-only.
+#    STATIC-only here; the actual pkg_add -> verify in the 7.9 VM (M3).
+# ---------------------------------------------------------------------------
+# The offline closure dir on the TARGET -- a build-fixed path baked into site79.tgz.
+# It lives on /usr/obj: the LARGEST auto-layout partition (~8.2 GiB) and dead
+# "scratch" space (src/obj) a fortress/desktop appliance never uses, so the closure
+# (136 MiB fortress .. ~1 GiB desktop) fits WITHOUT a custom disklabel -- the stock
+# auto-layout is exactly what makes the softraid FDE boot work (a custom layout that
+# put 'a' at offset 1024 broke it).  NOT / (only ~239 MiB) and NOT /usr/local
+# (pkg_add's WRITE target -> source+target on one fs would double-peak).
+_pkgdir='/usr/obj/_pkgs'
+# Build the PKG_PATH literal at site time, branching on the resolved startmode.
+# The stock installer records its chosen mirror in /etc/installurl; pkg_add
+# expands "installpath" in PKG_PATH to that mirror's packages dir, giving a real
+# local-then-mirror fallback on first boot (network open at L1/L2).
+if [ "$startmode" = "L3" ]; then
+	# L3: fail-closed pf is already loaded by /etc/rc -> mirror UNREACHABLE.
+	# Local-only; the offline closure MUST be complete (M3-VM gate).
+	_pkgpath="$_pkgdir"
+	log "L3: PKG_PATH=local-only ($_pkgdir); offline closure MUST be complete -- mirror is unreachable behind fail-closed pf (verify in M3)"
+else
+	# L1/L2: network open -> local first, then the installer mirror as a real
+	# fallback for any dependency the bundled closure is missing.
+	_pkgpath="$_pkgdir:installpath"
+fi
+
+# Idempotency: a sentinel marker line guards the append so a re-run cannot
+# double-append the velo block to rc.firsttime.
+_rf_dst="${VELO_ROOT}/etc/rc.firsttime"
+_rf_marker="# --- velo: offline package install (first boot) ---"
+if grep -qxF -- "$_rf_marker" "$_rf_dst" 2>/dev/null; then
+	log "velo rc.firsttime block already present -- skipping (idempotent re-run)"
+else
+# Emit the block.  The PKG_PATH line is interpolated (it depends on startmode);
+# the rest of the body stays literal via the quoted heredoc.  A pkg_add failure
+# is logged LOUDLY to the console and the log -- no silent partial install.
+{
+	printf '\n'
+	printf '%s\n' "$_rf_marker"
+	printf '# startmode=%s -> PKG_PATH=%s\n' "$startmode" "$_pkgpath"
+	printf '#   L1/L2: local-then-mirror fallback (network open).\n'
+	printf '#   L3:    local-ONLY -- fail-closed pf (loaded by /etc/rc before this)\n'
+	printf '#          makes the mirror unreachable, so the offline closure must\n'
+	printf '#          be complete; there is intentionally NO network fallback.\n'
+	printf 'export PKG_PATH=%s\n' "$_pkgpath"
+	# Emit the bare closure dir too, so the success branch below can reclaim it.
+	printf 'VELO_PKGDIR=%s\n' "$_pkgdir"
+	cat <<'EOF'
+if [ -s /etc/velo/installed.list ]; then
+	# -I no prompts; -l reads the name list (kept outside PKG_PATH so the closure
+	# dir stays pure package blobs).
+	if pkg_add -I -l /etc/velo/installed.list >/var/log/velo-pkg.log 2>&1; then
+		echo "velo: offline package install OK (see /var/log/velo-pkg.log)"
+		# Reclaim the one-shot offline closure now that pkg_add consumed it
+		# (136 MiB fortress .. ~1 GiB desktop).  ONLY on success, so a failed or
+		# partial install keeps the blobs for a retry.  VELO_PKGDIR was emitted
+		# just above by install.site (the build-fixed closure dir on /usr/obj).
+		if [ -n "${VELO_PKGDIR:-}" ] && [ -d "$VELO_PKGDIR" ]; then
+			rm -rf "$VELO_PKGDIR" && echo "velo: reclaimed offline closure $VELO_PKGDIR"
+		fi
+	else
+		# LOUD failure: do NOT swallow a partial/failed install.  On L3 this means
+		# the offline closure was incomplete and there is no mirror fallback.
+		echo "velo: ERROR pkg_add FAILED -- see /var/log/velo-pkg.log" >&2
+		echo "velo: ERROR pkg_add FAILED -- see /var/log/velo-pkg.log" \
+			>>/var/log/velo-pkg.log 2>&1
+		logger -t velo "pkg_add failed at first boot (see /var/log/velo-pkg.log)" \
+			2>/dev/null || true
+	fi
+fi
+# velo: enable + start Tor if it was installed.  REQUIRED at L3 -- the fail-closed
+# pf gives egress ONLY to the _tor user, so without tor running the box has no
+# route out at all (a brick).  Harmless at L1/L2.  Runs after pkg_add so tor is present.
+if pkg_info -e 'tor-*' >/dev/null 2>&1; then
+	rcctl enable tor && rcctl start tor && echo "velo: tor enabled + started" || echo "velo: WARN tor enable/start failed"
+fi
+# --- end velo block ---
+EOF
+} >>"$_rf_dst"
+	log "appended offline pkg_add block to /etc/rc.firsttime (startmode=$startmode PKG_PATH=$_pkgpath; verify pkg_add in M3)"
+fi
+
+# ---------------------------------------------------------------------------
+# 9b. BOOT-TIME pf INVARIANT -- re-assert the chosen fail-closed ruleset.
+#     The stock /etc/rc DOES load /etc/pf.conf, but that load runs immediately
+#     after the boot-time library relink (`wait_reorder_libs`).  On a slow/degraded
+#     boot this load was observed (live, M3 VM) to INTERMITTENTLY not take effect,
+#     leaving the permissive early-boot MINIMAL ruleset active -- which at L3 allows
+#     clearnet DNS (a leak) and starves Tor (only port 53 passes, so tor cannot
+#     reach relays).  For a fail-closed anonymity appliance the loaded firewall is a
+#     hard INVARIANT, not best-effort.  /etc/rc sources /etc/rc.local at the very end
+#     of boot, when the system is fully settled, so we re-assert /etc/pf.conf there:
+#     idempotent (re-loading the same file is a no-op), level-agnostic (always the
+#     chosen ruleset, never the boot minimal), and LOUD if it still cannot load.
+#     Append (>>), sentinel-guarded so a re-run cannot double-append.
+_rl_dst="${VELO_ROOT}/etc/rc.local"
+_rl_marker="# --- velo: re-assert fail-closed pf ruleset at end of boot ---"
+if grep -qxF -- "$_rl_marker" "$_rl_dst" 2>/dev/null; then
+	log "velo rc.local pf re-assert already present -- skipping (idempotent re-run)"
+else
+	{
+		printf '\n%s\n' "$_rl_marker"
+		cat <<'EOF'
+if [ -f /etc/pf.conf ]; then
+	# Re-load the chosen ruleset; retry once after a short settle, then log loudly.
+	pfctl -f /etc/pf.conf 2>/dev/null || { sleep 2; pfctl -f /etc/pf.conf 2>/dev/null; } || \
+		logger -t velo "ERROR: /etc/pf.conf failed to load at boot -- pf may be on the permissive minimal ruleset (fail-closed posture NOT guaranteed)"
+fi
+# --- end velo pf re-assert ---
+EOF
+	} >>"$_rl_dst"
+	chmod 0644 "$_rl_dst" 2>/dev/null || true
+	log "appended pf re-assert to /etc/rc.local (boot-time fail-closed invariant)"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. Cleanup.  Keep /etc/velo/answers as an audit record but tighten perms.
+#     The installer removes /install.site automatically after it runs.
+# ---------------------------------------------------------------------------
+if [ -f "${VELO_ROOT}/etc/velo/answers" ]; then
+	chmod 0600 "${VELO_ROOT}/etc/velo/answers" 2>/dev/null || true
+fi
+
+log "install.site done: profile=$profile startmode=$startmode encrypt=$encrypt"
+exit 0

@@ -1,0 +1,4 @@
+M2 ships the *.list files only. The actual *.tgz package blobs (and their full
+dependency closure) are populated at M3 in the OpenBSD 7.9 VM -- the Void build
+host has no OpenBSD packages. This placeholder keeps the dir in git; the packer
+(build/make-site-tgz.sh) excludes it from site79.tgz.

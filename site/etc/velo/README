@@ -1,0 +1,18 @@
+/etc/velo -- velo install audit + level config (M2).
+
+This directory is shipped by site79.tgz and survives into the booted system as
+an audit record of how this box was provisioned.
+
+Contents:
+  answers          per-install TUI choices (profile/startmode/pkgs/...), written
+                   by velo-install BEFORE install.site runs; PARSED (never
+                   sourced -- the file is data, never executed, to avoid an RCE
+                   vector) + re-validated by install.site. Mode 0600.
+                   Absent -> safe floor minimal+L1.
+  pf/              the three level pf.conf variants (pf.l1/l2/l3.conf). install.site
+                   copies the chosen one to /etc/pf.conf; the others stay here for
+                   the future v0.2 L1/L2/L3 switcher.
+  sysctl/          per-level sysctl deltas (sysctl.l1/l2/l3.conf), APPENDED to
+                   /etc/sysctl.conf by install.site (never overwriting the base).
+
+Nothing here is secret. The FDE passphrase is never written to the target.

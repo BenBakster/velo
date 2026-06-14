@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- velo homely -- openbox root menu (right-click desktop) -->
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+  <menu id="root-menu" label="Velo">
+    <item label="Термінал (Terminator)">
+      <action name="Execute"><command>terminator</command></action>
+    </item>
+    <item label="Термінал (xterm)">
+      <action name="Execute"><command>xterm</command></action>
+    </item>
+    <separator/>
+    <item label="Firefox">
+      <action name="Execute"><command>firefox</command></action>
+    </item>
+    <item label="Файли (Thunar)">
+      <action name="Execute"><command>thunar</command></action>
+    </item>
+    <separator/>
+    <item label="Розкладка us/ua/ru (Shift+Alt)">
+      <action name="Execute"><command>setxkbmap -layout us,ua,ru -option grp:shift_alt_toggle</command></action>
+    </item>
+    <separator/>
+    <menu id="ob-config" label="Openbox">
+      <item label="Перечитати конфіг">
+        <action name="Reconfigure"/>
+      </item>
+      <item label="Перезапустити WM">
+        <action name="Restart"/>
+      </item>
+    </menu>
+    <item label="Вийти з X (logout)">
+      <action name="Exit"><prompt>yes</prompt></action>
+    </item>
+  </menu>
+</openbox_menu>

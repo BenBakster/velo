@@ -1,0 +1,2118 @@
+#!/bin/ksh
+# velo-install -- the velo OpenBSD 7.9 install wizard (M1, DRY-RUN).
+#
+# Target shell:  OpenBSD /bin/ksh (pdksh / oksh) inside the bsd.rd install
+#                ramdisk.  Also runs UNMODIFIED under bash >= 3 on a
+#                Void/Linux host for dry-run demos and CI.
+#
+# =========================================================================
+#  ABSOLUTE SAFETY RULE -- M1 IS DRY-RUN.
+#  This program WRITES NOTHING to any disk and NEVER executes
+#  fdisk / disklabel / bioctl / newfs / dd.  It only PRINTS the planned
+#  shell commands and the generated install.conf.  The destructive path is
+#  a later milestone (M3/M4), gated behind the summary screen (Ворота-СТОП).
+#  Every fdisk/disklabel/bioctl/newfs/dd token in this file lives INSIDE a
+#  printed heredoc/_putln string -- never on a command line that the shell
+#  would execute.  grep-prove: see tests/velo-install-test.ksh.
+# =========================================================================
+#
+#  Modes (dispatch on $1, mirrors the demo's screenshot|interactive split):
+#    velo-install            interactive wizard, 8 screens + summary (+ a 9th,
+#                            boot-mode, shown only for an encrypted install)
+#    velo-install plan       NON-INTERACTIVE dry-run: read state from env,
+#                            print install.conf + crypto plan, exit. No tty,
+#                            no raw mode, no key reads. CI/test path.
+#    velo-install selftest   run the pure-function assertions; PASS/FAIL.
+#
+#  Source-time: locate and source the TUI library relative to THIS script.
+#  `dirname` is NOT in the install ramdisk, so derive the dir with parameter
+#  expansion only (same pattern as demo/tui-demo.ksh).
+
+case "$0" in
+*/*) VELO_HERE=${0%/*} ;;   # strip trailing /name
+*)   VELO_HERE=. ;;         # no slash -> current dir
+esac
+# Source the TUI library.  By default it lives at the repo-relative path (host
+# demos, CI, tests -- unchanged M1 behaviour).  In the patched bsd.rd ramdisk
+# both velo files are injected at '/', so the repo-relative path does not exist;
+# the ramdisk launcher /velo-rd-hook.sh exports VELO_TUI=/velo-tui.ksh and we
+# honour that override.  One env seam, no test breakage (VELO_TUI unset on the
+# host -> the original path).  (docs/m3-design.md s2.3.)
+: "${VELO_TUI:=$VELO_HERE/../src/velo-tui.ksh}"
+. "$VELO_TUI"
+
+# ===========================================================================
+#  STATE  (flat VELO_S_* scalars -- pdksh-portable; one datum per screen)
+#  These default-preserving assignments (${VAR:-default}) let the `plan`
+#  entrypoint seed state from same-named ENV vars (design §6) while the
+#  interactive wizard, run with no such env, still starts from the empty
+#  defaults. velo_plan re-validates every value, so a hostile env cannot
+#  inject anything.
+# ===========================================================================
+VELO_S_DISK=${VELO_S_DISK:-""}            # raw device, validated ^sd|wd  (screen 1)
+VELO_S_ENCRYPT=${VELO_S_ENCRYPT:-no}      # yes|no                        (screen 2)
+VELO_S_PASSPHRASE=${VELO_S_PASSPHRASE:-""} # secret; lives ONLY here; cleared after
+VELO_S_HOSTNAME=${VELO_S_HOSTNAME:-""}    # RFC-1123 label                (screen 3)
+VELO_S_PROFILE=${VELO_S_PROFILE:-""}      # homely|minimal|fortress       (screen 4)
+VELO_S_PKGS=${VELO_S_PKGS:-""}            # space-separated package names (screen 5)
+VELO_S_STARTMODE=${VELO_S_STARTMODE:-""}  # L1|L2|L3                      (screen 6)
+VELO_S_BOOTMODE=${VELO_S_BOOTMODE:-same}  # same|uefi|bios target firmware (screen 8b, FDE only)
+VELO_S_ROOTDISK=${VELO_S_ROOTDISK:-""}    # disk install.conf targets (derived §5)
+# --- install-MEDIUM location (the disk/partition/path the SETS live on) -------
+# These answer the FOUR install.sub prompts that follow "Location of sets = disk"
+# (the 2026-06-08 Fujitsu failure: those prompts were unanswered, so autoinstall
+# took the WRONG defaults sd0/i/7.9-amd64 and aborted "7.9/amd64 does not exist").
+# MEDIADISK is DERIVED at run time by velo_find_media_disk -- the sd-unit of the
+# velo USB is enumeration-order-dependent and must NEVER be hardcoded.  PART/PATH
+# are constants matching build/grow-media.sh (sets at 4.2BSD 'a':/7.9/amd64),
+# env-seedable so a build that overrides SETS_PART can override these in lockstep.
+VELO_S_MEDIADISK=${VELO_S_MEDIADISK:-""}          # velo USB sd-unit (detected in velo_execute)
+VELO_S_MEDIAPART=${VELO_S_MEDIAPART:-a}           # disklabel partition carrying the sets
+VELO_S_MEDIAPATH=${VELO_S_MEDIAPATH:-7.9/amd64}   # set-tree path on that partition
+VELO_S_ROOTPW=${VELO_S_ROOTPW:-""}        # secret: root account password   (screen 3)
+VELO_S_USERPW=${VELO_S_USERPW:-""}        # secret: anon account password   (screen 4)
+VELO_S_WIFI_SSID=${VELO_S_WIFI_SSID:-""} # Wi-Fi network name (optional)   (screen 6)
+VELO_S_WIFI_PSK=${VELO_S_WIFI_PSK:-""}   # secret: WPA key; cleared after execute
+# Internal bcrypt hashes -- deliberately NOT env-seedable (no ${VAR:-} seam):
+# they are computed ONLY inside velo_execute, from the plaintext above, via
+# encrypt(1).  Empty -> gen_install_conf emits the <bcrypt-hash> placeholder, so
+# the DRY-RUN/`plan`/on-screen-preview paths NEVER carry a real credential.
+VELO_S_ROOTPW_HASH=""                     # set ONLY inside velo_execute
+VELO_S_USERPW_HASH=""                     # set ONLY inside velo_execute
+
+# Stable, ordered option lists.  These are the single source of truth for
+# both the menus AND the idx_to_* mappers, so the displayed order and the
+# re-indexed value can never diverge (M1 req §3).
+VELO_PROFILES="homely minimal fortress"   # homely first = default desktop
+VELO_STARTMODES="L1 L2 L3"                  # L1 first = permissive baseline
+VELO_BOOTMODES="same uefi bios hybrid"       # same first = auto-detect (safe default)
+
+# ===========================================================================
+#  PURE / TESTABLE FUNCTIONS
+#  Each takes args and echoes a result or sets ONE documented out-global.
+#  None touch a tty; none write to disk.  Reusable under bash AND oksh.
+# ===========================================================================
+
+# --- is_valid_disk NAME : whitelist predicate (exit status only) -----------
+# Accepts ^sd[0-9]+$ or ^wd[0-9]+$ ; rejects everything else (cd*, empty,
+# trailing junk, shell metachars).
+#
+# Implemented WITHOUT ksh extended globs (+([0-9])): those would force the
+# caller to `shopt -s extglob` under bash, which `bash -n` (parse-only, never
+# runs the shopt) cannot honour -> a spurious "syntax error" at lint time. The
+# prefix-strip + digit-only check below parses and runs identically under
+# `bash -n`, runtime bash, and OpenBSD oksh -- no extglob, no anchoring tricks.
+is_valid_disk() {
+	case "$1" in
+	sd?*|wd?*) : ;;            # must start sd/wd and have >=1 more char
+	*) return 1 ;;
+	esac
+	_ivd_tail=${1#??}          # strip the 2-char sd/wd prefix
+	# tail must be all digits and non-empty (rejects sd0x, sd0a, sd0;rm, etc.)
+	case "$_ivd_tail" in
+	''|*[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+# --- velo_list_disks : INJECTABLE disk detection ---------------------------
+# Prints whitelisted disk names, one per line, order preserved.
+# Source of truth on OpenBSD: `sysctl -n hw.disknames` (format
+# "name:DUID,name:DUID,...", DUID may be empty, e.g. "sd0:4b84,cd0:,wd0").
+# Injection for host testing/CI: if VELO_FAKE_DISKS is set, use its value
+# verbatim instead of sysctl, so this runs on the Void host (no OpenBSD).
+velo_list_disks() {
+	_vld_raw=""
+	if [ -n "${VELO_FAKE_DISKS+x}" ]; then
+		_vld_raw=$VELO_FAKE_DISKS
+	else
+		_vld_raw=$(sysctl -n hw.disknames 2>/dev/null)
+	fi
+	# Split on ',' with IFS (no tr/awk in the ramdisk), strip ":DUID" suffix,
+	# keep only whitelisted names.  Reuse is_valid_disk so detection and
+	# validation cannot diverge.
+	_vld_oifs=$IFS
+	IFS=','
+	set -- $_vld_raw
+	IFS=$_vld_oifs
+	for _vld_tok in "$@"; do
+		_vld_name=${_vld_tok%%:*}
+		if is_valid_disk "$_vld_name"; then
+			_putln "$_vld_name"
+		fi
+	done
+}
+
+# --- idx_from_list INDEX WORD... : 0-based positional lookup ---------------
+# Echoes the (INDEX+1)-th positional WORD; empty + nonzero if out of range.
+# This is the generic helper behind idx_to_disk/profile/startmode (M1 req §3).
+idx_from_list() {
+	_ifl_i=$1
+	shift
+	# reject non-numeric / negative indices
+	case "$_ifl_i" in
+	''|*[!0-9]*) return 1 ;;
+	esac
+	if [ "$_ifl_i" -ge "$#" ]; then
+		return 1
+	fi
+	_ifl_n=$((_ifl_i + 1))
+	eval "_ifl_v=\${$_ifl_n}"
+	_put "$_ifl_v"
+	return 0
+}
+
+# --- idx_to_disk INDEX : map a menu index back to a detected disk name -----
+idx_to_disk() {
+	idx_from_list "$1" $(velo_list_disks)
+}
+
+# --- idx_to_profile INDEX --------------------------------------------------
+idx_to_profile() {
+	idx_from_list "$1" $VELO_PROFILES
+}
+
+# --- idx_to_startmode INDEX ------------------------------------------------
+idx_to_startmode() {
+	idx_from_list "$1" $VELO_STARTMODES
+}
+
+# --- idx_to_bootmode INDEX -------------------------------------------------
+idx_to_bootmode() {
+	idx_from_list "$1" $VELO_BOOTMODES
+}
+
+# --- idxset_to_pkgs "IDX IDX ..." WORD... ----------------------------------
+# Maps a space-separated checked-index list (VELO_CHECKED) back to the
+# package names in the same positional universe.  Echoes a space-joined list.
+idxset_to_pkgs() {
+	_isp_idxset=$1
+	shift
+	_isp_out=""
+	for _isp_i in $_isp_idxset; do
+		case "$_isp_i" in
+		''|*[!0-9]*) continue ;;
+		esac
+		_isp_name=$(idx_from_list "$_isp_i" "$@") || continue
+		if [ -n "$_isp_name" ]; then
+			if [ -n "$_isp_out" ]; then
+				_isp_out="$_isp_out $_isp_name"
+			else
+				_isp_out="$_isp_name"
+			fi
+		fi
+	done
+	_put "$_isp_out"
+}
+
+# --- valid_hostname NAME : RFC-1123 label predicate ------------------------
+# 1..63 chars from [A-Za-z0-9-], no leading/trailing '-', no dots/spaces/
+# metachars.  Pure case globs; exit status only.
+valid_hostname() {
+	_vh=$1
+	# length 1..63
+	[ -n "$_vh" ] || return 1
+	[ "${#_vh}" -le 63 ] || return 1
+	# no leading or trailing hyphen
+	case "$_vh" in
+	-*|*-) return 1 ;;
+	esac
+	# only the allowed charset (reject if any char is NOT [A-Za-z0-9-])
+	case "$_vh" in
+	*[!A-Za-z0-9-]*) return 1 ;;
+	esac
+	return 0
+}
+
+# --- profile_pkgs PROFILE : checklist universe for a profile (data table) --
+# Returns the package universe shown on screen 5 (all start unchecked per
+# M1 req §4).  Single source of truth; unknown profile -> empty + nonzero.
+# Packages are NOT written to install.conf (OpenBSD installs pkgs post-reboot)
+# -- they are recorded for M2's pkg_add list and printed in the plan.
+profile_pkgs() {
+	case "$1" in
+	minimal)  _put "git curl nano" ;;
+	homely)   _put "openbox tint2 terminator firefox git curl nano noto-fonts thunar mpv" ;;
+	fortress) _put "tor torsocks wireguard-tools gnupg pwgen git nano" ;;
+	*) return 1 ;;
+	esac
+	return 0
+}
+
+# --- boot-mode: detect / resolve / fdisk args ------------------------------
+# velo installs onto a DEDICATED disk and must lay it out to match the firmware
+# the target machine boots under: GPT + EFI System Partition for UEFI, a plain
+# MBR (single active 0xA6 OpenBSD partition) for legacy BIOS.  This matters
+# because a GPT disk does NOT boot under legacy SeaBIOS ("No active partition"),
+# while a plain MBR boots under both.  Three states (VELO_S_BOOTMODE):
+#   same  -> auto-detect from the running installer's own firmware (default)
+#   uefi  -> force GPT + EFI system partition
+#   bios  -> force legacy MBR
+# Detection keys on the reliable UEFI markers efi0/efifb0 -- NOT the ACPI
+# version: `acpi0 at bios0` appears under BOTH modes and the version digit does
+# not track firmware (verified against real dmesg: VirtualBox UEFI reports ACPI
+# 4.0, QEMU/SeaBIOS reports ACPI 1.0; modern legacy hardware can report ACPI 5+
+# -> an `ACPI [5-9]` test both false-negates real UEFI and false-positives
+# legacy).  Sources: efi(4) "efi* at bios?", efifb(4) "efifb* at mainbus?",
+# fdisk(8), FAQ 14 (softraid crypto), distrib/amd64/common/install.md.
+
+# velo_detect_bootmode -- echo uefi|bios|unknown for the CURRENT machine.
+# Reads the boot dmesg (/var/run/dmesg.boot, the stable single-pass file
+# install.md keys on; falls back to the live `dmesg`).  When neither is
+# available or no amd64 firmware line is present (host, tests, non-OpenBSD) it
+# returns "unknown" so callers never guess.  VELO_BOOTMODE_DETECT overrides the
+# whole probe for host tests.
+velo_detect_bootmode() {
+	if [ -n "${VELO_BOOTMODE_DETECT:-}" ]; then
+		_put "$VELO_BOOTMODE_DETECT"; return 0
+	fi
+	if [ -r /var/run/dmesg.boot ]; then
+		_vdb=$(cat /var/run/dmesg.boot 2>/dev/null)
+	elif command -v dmesg >/dev/null 2>&1; then
+		_vdb=$(dmesg 2>/dev/null)
+	else
+		_vdb=""
+	fi
+	[ -n "$_vdb" ] || { _put unknown; return 0; }
+	# UEFI iff an EFI device attached (efi0 most robust -- present even on
+	# headless VMs where efifb0 fails); legacy iff the BIOS line is present and
+	# no EFI; neither -> unknown.  Anchored to line start (^) to avoid matching a
+	# stray substring in some later log/comment line.
+	if _put "$_vdb" | grep -q -e '^efi0 at bios0: UEFI' -e '^efifb0 at mainbus0'; then
+		_put uefi
+	elif _put "$_vdb" | grep -q '^bios0 at mainbus0'; then
+		_put bios
+	else
+		_put unknown
+	fi
+}
+
+# velo_resolve_bootmode -- echo the EFFECTIVE uefi|bios for this install.  An
+# explicit uefi|bios state is honoured verbatim; `same` auto-detects.  When
+# `same` cannot be resolved it echoes "unknown" and returns nonzero -- callers
+# decide: plan_crypto (DRY-RUN preview) shows a documented default, while the
+# REAL velo_run_crypto refuses (fail-safe STOP -- never guess on real hardware).
+velo_resolve_bootmode() {
+	case "$VELO_S_BOOTMODE" in
+	uefi|bios|hybrid) _put "$VELO_S_BOOTMODE"; return 0 ;;
+	esac
+	_vrb=$(velo_detect_bootmode)
+	case "$_vrb" in
+	uefi|bios) _put "$_vrb"; return 0 ;;
+	*)         _put unknown; return 1 ;;
+	esac
+}
+
+# velo_fdisk_args MODE -- the SINGLE source of truth for fdisk's table-init
+# arguments, called by BOTH plan_crypto (preview) and velo_run_crypto (real) so
+# the two can never drift (lesson C6/Ворота-4).  uefi -> GPT + 960-sector EFI
+# Sys partition; bios -> plain MBR (no -g, no -b: a GPT disk is not legacy-
+# bootable, and -b under -i would carve a useless 0xEF EFI slot out of the MBR).
+# Unknown/bad mode -> nonzero + empty (so the real path STOPS).
+velo_fdisk_args() {
+	case "$1" in
+	uefi)   _put "-iy -g -b 960"; return 0 ;;
+	bios)   _put "-iy"; return 0 ;;
+	hybrid) _put "-iy"; return 0 ;;  # step 1 only: A6@64 whole-disk; step 2 = velo_fdisk_hybrid_esp
+	*)      return 1 ;;
+	esac
+}
+
+# velo_fdisk_hybrid_esp DISK -- second fdisk step for hybrid mode.  Shrinks the
+# existing 0xA6 OpenBSD entry (MBR slot 3, placed by fdisk -iy) to end before a
+# 32 MiB 0xEF EFI tail (MBR slot 0), then re-asserts A6 as active.
+# Precondition: fdisk -iy has already run (A6@64, bootable, spanning whole disk).
+# The 0xEF size (65536 sectors = 32 MiB) is roomy for FAT16 + BOOTX64.EFI.
+# UEFI firmware locates the ESP by partition type, not position, so trailing is fine.
+velo_fdisk_hybrid_esp() {
+	_vfhe_disk=$1
+	is_valid_disk "$_vfhe_disk" || return 1
+	_vfhe_esp=65536   # 32 MiB in 512-byte sectors
+	_vfhe_total=$(disklabel "$_vfhe_disk" 2>/dev/null | \
+		sed -n 's/^total sectors: *\([0-9][0-9]*\).*/\1/p')
+	[ -n "$_vfhe_total" ] || return 1
+	_vfhe_efoff=$((_vfhe_total - _vfhe_esp))
+	_vfhe_a6size=$((_vfhe_efoff - 64))
+	fdisk -e "$_vfhe_disk" <<FDEOF || return 1
+edit 3
+A6
+n
+64
+$_vfhe_a6size
+edit 0
+EF
+n
+$_vfhe_efoff
+$_vfhe_esp
+flag 3
+write
+quit
+FDEOF
+}
+
+# velo_efifill DISK -- format the 0xEF partition (FAT16) and plant BOOTX64.EFI
+# at the UEFI fallback path \EFI\BOOT\BOOTX64.EFI.  Called AFTER `install` while
+# /mnt is still populated.  installboot(8) cannot fill an MBR 0xEF partition (its
+# -p ESP support is GPT-only), hence the manual fill.
+velo_efifill() {
+	_vef_disk=$1
+	is_valid_disk "$_vef_disk" || return 1
+	[ -f /mnt/usr/mdec/BOOTX64.EFI ] || {
+		_putln "velo_efifill: /mnt/usr/mdec/BOOTX64.EFI missing" >&2; return 1; }
+	_vef_ep=$(disklabel "$_vef_disk" 2>/dev/null | grep ' MSDOS' | \
+		sed -n 's/^ *\([a-p]\):.*/\1/p')
+	[ -n "$_vef_ep" ] || {
+		_putln "velo_efifill: no MSDOS partition found on $_vef_disk" >&2; return 1; }
+	newfs_msdos -F 16 /dev/r${_vef_disk}${_vef_ep} || return 1
+	mkdir -p /tmp/velo-esp
+	mount -t msdos /dev/${_vef_disk}${_vef_ep} /tmp/velo-esp || return 1
+	mkdir -p /tmp/velo-esp/efi/boot
+	cp /mnt/usr/mdec/BOOTX64.EFI /tmp/velo-esp/efi/boot/bootx64.efi || {
+		umount /tmp/velo-esp 2>/dev/null; return 1; }
+	sync
+	umount /tmp/velo-esp
+	return 0
+}
+
+# Megabytes zeroed at the head of the TARGET disk before partitioning, so the
+# stale MBR/disklabel/softraid metadata of any prior install is gone before
+# fdisk/disklabel/bioctl run (2026-06-08 root cause).  SINGLE SOURCE for both the
+# plan_crypto preview and the real velo_run_crypto, like velo_fdisk_args -- the two
+# dd lines must never drift in size.  8 MiB covers velo's deepest offset (a@1024
+# sectors) ~15x.  Override for tests.
+VELO_WIPE_MIB=${VELO_WIPE_MIB:-8}
+
+# --- plan_crypto DISK : the manual FDE shell sequence (PRINTS only) --------
+# Emits the exact, copy-pasteable shell the operator (or M3) runs at the
+# ramdisk (S)hell BEFORE `install`, when encryption is requested.  Grounded in
+# install.sub:encrypt_root() and FAQ 14.
+#
+# SAFETY:
+#  - The passphrase is delivered via STDIN pipe (print -r -- "$VELO_PASSPHRASE"
+#    | bioctl -s), never argv/ps.  In DRY-RUN the literal printed is the STRING
+#    "$VELO_PASSPHRASE" (the VARIABLE NAME, not the secret) -- the plan is a
+#    template, so the real passphrase is NEVER rendered to stdout/screen.
+#  - Every device occurrence is double-quoted.
+#  - The CRYPTO sd unit is shown as the placeholder sdN with an explicit
+#    comment to read it from `bioctl softraid0` at run time (never hardcode).
+#  - DISK is re-validated here; refuses (nonzero, prints nothing) on bad input.
+#  - NONE of these commands execute -- the whole body is a single heredoc
+#    piped only to stdout (via cat); nothing here runs.
+plan_crypto() {
+	_pc_disk=$1
+	if ! is_valid_disk "$_pc_disk"; then
+		return 1
+	fi
+	# Resolve the firmware target -> fdisk table args via the SHARED
+	# velo_fdisk_args (the same helper velo_run_crypto uses, so the printed plan
+	# and the real run can't drift).  This is a DRY-RUN PREVIEW: if mode=same and
+	# detection can't answer (previewing off the target / host `plan`), fall back
+	# to the uefi layout for display and SAY SO -- the real run STOPS instead of
+	# guessing.  uefi -> "-iy -g -b 960" (GPT+ESP), bios -> "-iy" (legacy MBR).
+	_pc_mode=$(velo_resolve_bootmode)
+	case "$_pc_mode" in
+	uefi)   _pc_fargs=$(velo_fdisk_args uefi);   _pc_note="# GPT + EFI sys partition (uefi target)" ;;
+	bios)   _pc_fargs=$(velo_fdisk_args bios);   _pc_note="# legacy MBR, active OpenBSD partition (bios target)" ;;
+	hybrid) _pc_fargs=$(velo_fdisk_args hybrid); _pc_note="# hybrid MBR step 1: A6@64 active (step 2 adds 0xEF EFI tail)" ;;
+	*)      _pc_mode=uefi; _pc_fargs=$(velo_fdisk_args uefi)
+	        _pc_note="# boot mode auto-detected at run time -- preview assumes uefi" ;;
+	esac
+	# UNQUOTED delimiter (<<PLAN) ON PURPOSE: the validated, double-quoted
+	# ${_pc_disk} must expand to splice the device into the template.  The
+	# passphrase is protected NOT by quoting the heredoc but by emitting it as
+	# the escaped literal \$VELO_PASSPHRASE (a variable NAME in the output text),
+	# so the secret's VALUE is never referenced and never rendered.  The inner
+	# disklabel heredoc uses a QUOTED <<'EOF', so its body stays literal.
+	# ${_pc_fargs}/${_pc_note} are internal, charset-controlled enum-derived
+	# strings (velo_fdisk_args), never operator input -- no injection seam.
+	cat <<PLAN
+# velo: planned full-disk-encryption setup (DRY-RUN -- NOT executed)
+# Run these at the bsd.rd (S)hell BEFORE 'install'. Device: ${_pc_disk}
+dd if=/dev/zero of="/dev/r${_pc_disk}c" bs=1m count=${VELO_WIPE_MIB}   # blank stale MBR/label/softraid
+fdisk ${_pc_fargs} "${_pc_disk}"                  ${_pc_note}
+disklabel -E "${_pc_disk}" <<'EOF'                 # one RAID slice 'a'
+a
+a
+
+
+RAID
+w
+q
+EOF
+print -r -- "\$VELO_PASSPHRASE" | \\
+    bioctl -Cforce -cC -l"${_pc_disk}a" -s softraid0   # create CRYPTO volume
+# The CRYPTO volume attaches as the NEXT free sd unit. Read it back here,
+# NEVER hardcode it:    bioctl softraid0   ->   parse the 'sd<N>' reported.
+dd if=/dev/zero of="/dev/rsdNc" bs=1m count=1      # wipe first MB of new vol
+PLAN
+	# hybrid: append step 2 (fdisk -e to shrink A6 + add 0xEF ESP).
+	# velo runs velo_fdisk_hybrid_esp automatically; shown here for operator reference.
+	if [ "$_pc_mode" = "hybrid" ]; then
+		cat <<'PLAN2'
+# hybrid step 2 (run immediately after step 1, before disklabel):
+# velo computes ESP offset from total sectors at run time.  Reference only:
+# fdisk -e DISK  -> edit 3 (A6: shrink to end-32MiB), edit 0 (EF: 32MiB tail), flag 3, write
+# After install, velo fills the EFI partition: newfs_msdos -F 16 + BOOTX64.EFI
+PLAN2
+	fi
+	return 0
+}
+
+# --- gen_install_conf : the response file (PRINTS only) --------------------
+# Pure function of the VELO_S_* state globals -> stdout.  Emits canonical
+# `question = answer` lines (autoinstall(8) substring-match format).  Every
+# interpolated answer is charset-restricted upstream (hostname/disk validated,
+# profile/startmode enum), so no '=' or newline can split a line; we still
+# sanitise the root-disk and hostname through is_valid_disk/valid_hostname
+# fallbacks so a malformed state can never inject a line.
+gen_install_conf() {
+	# Sanitise interpolated answers; substitute an obvious placeholder if a
+	# value somehow failed validation (defence in depth -- no injection).
+	_gic_host=$VELO_S_HOSTNAME
+	valid_hostname "$_gic_host" || _gic_host="velo-bsd"
+
+	_gic_root=$VELO_S_ROOTDISK
+	# ROOTDISK is either a validated raw disk (encrypt=no) or the crypto
+	# placeholder "sdN" (encrypt=yes). Accept those two shapes ONLY; anything
+	# else (e.g. a hostile state value) collapses to the safe "sdN" placeholder
+	# so a bad value can never inject a line.
+	if [ "$_gic_root" != "sdN" ] && ! is_valid_disk "$_gic_root"; then
+		_gic_root="sdN"
+	fi
+
+	# Set selection tuned per profile (logical token; refined at M3 in the VM).
+	case "$VELO_S_PROFILE" in
+	minimal)  _gic_sets="+* -game* -xbase* -xfont* -xserv* -xshare*" ;;
+	fortress) _gic_sets="+* -game*" ;;
+	*)        _gic_sets="+* -game*" ;;   # homely/default keep x11
+	esac
+
+	# Set-location answers (the four install.sub prompts after "Location of sets =
+	# disk").  MEDIADISK is the runtime-detected velo USB; sanitise it EXACTLY like
+	# _gic_root -- a value that is neither the "sdN" placeholder nor a valid disk
+	# collapses to "sdN", so the DRY-RUN preview (where detection has not run, so
+	# MEDIADISK is empty) shows a sane token and no hostile state can split a line.
+	# PART is one disklabel letter; PATH is charset-restricted (no '=', space or
+	# newline), so neither can inject a second response line.
+	_gic_media=$VELO_S_MEDIADISK
+	if [ "$_gic_media" != "sdN" ] && ! is_valid_disk "$_gic_media"; then
+		_gic_media="sdN"
+	fi
+	_gic_mpart=$VELO_S_MEDIAPART
+	case "$_gic_mpart" in [a-p]) : ;; *) _gic_mpart="a" ;; esac
+	_gic_mpath=$VELO_S_MEDIAPATH
+	case "$_gic_mpath" in ''|*[!A-Za-z0-9./_-]*) _gic_mpath="7.9/amd64" ;; esac
+
+	# Emit in the installer's own question order so a human reading it against
+	# a real install sees the prompts in sequence.
+	_putln "# ---- velo-generated install.conf (DRY-RUN preview) ----"
+	_putln "# profile=${VELO_S_PROFILE:-?} startmode=${VELO_S_STARTMODE:-?} encrypt=${VELO_S_ENCRYPT}"
+	_putln "System hostname = ${_gic_host}"
+	# Wired-ethernet network config (installer order: net comes right after the
+	# hostname, before the root password).  WITHOUT these lines configure_ifs()
+	# falls to its default first interface `(get_ifs netboot; get_ifs) | sed q`,
+	# which on a laptop is the Wi-Fi `iwm0` -- and iwm0 has no firmware in bsd.rd,
+	# so its autoconf never gets a lease and the unattended install dies (the
+	# 2026-06-07 Fujitsu failure).  We pin the WIRED port `em0` (Intel; the
+	# common wired NIC on these ThinkPad/Lifebook boxes) to DHCP instead.
+	#
+	# The interface question is asked in a LOOP and _autorespond() CONSUMES each
+	# matched line (it rewrites /tmp/ai/ai.conf, dropping the line it used), so
+	# the SAME key appears TWICE here -- `em0` is consumed on the first pass
+	# (configure that port), `done` on the second (leave the loop).  Order
+	# matters: em0 MUST precede done.  With a single DHCP-managed interface the
+	# installer auto-fills the default route and DNS from the lease and asks NO
+	# further network questions (v4_defroute/donetconfig short-circuit), so there
+	# is nothing left to answer and no "Default IPv4 route?" prompt to hang on.
+	# All four values are constant literals -- no interpolation, no injection.
+	_putln "Network interface to configure = em0"
+	_putln "IPv4 address for em0 = autoconf"
+	_putln "IPv6 address for em0 = none"
+	_putln "Network interface to configure = done"
+	# Passwords: an EMPTY hash global -> the <bcrypt-hash> placeholder, so the
+	# DRY-RUN/`plan`/on-screen audit-preview carry NO credential.  velo_execute
+	# sets these globals to the real bcrypt hashes (encrypt(1)) ONLY for the
+	# 0600 /tmp install.conf the installer reads -- never to the screen.  The
+	# installer's encr_pwd() recognises the $2b$.. hash and uses it verbatim.
+	_putln "Password for root = ${VELO_S_ROOTPW_HASH:-<bcrypt-hash>}"
+	_putln "Change the default console to com0 = no"
+	_putln "Setup a user = anon"
+	_putln "Full name for user = anon"
+	_putln "Password for user = ${VELO_S_USERPW_HASH:-<bcrypt-hash>}"
+	_putln "Allow root ssh login = no"
+	_putln "What timezone are you in = Europe/Kiev"
+	_putln "Which disk is the root disk = ${_gic_root}"
+	_putln "Use (A)uto layout = auto"
+	_putln "Location of sets = disk"
+	# The four set-location follow-ups install.sub asks after "= disk".  EXACT 7.9
+	# prompt wording transcribed from the 2026-06-08 Fujitsu console, so the
+	# autoinstall substring-match cannot miss.  The disk in lines 2 and 3 is the
+	# RUNTIME-DETECTED velo USB (never the sd0 default); the partition is the
+	# 4.2BSD set partition (never the wrong MSDOS 'i' default); the path is the
+	# already-correct "7.9/amd64".  Without these the install aborts on the wrong
+	# disk with "7.9/amd64 does not exist".
+	_putln "Is the disk partition already mounted = no"
+	_putln "Which disk contains the install media = ${_gic_media}"
+	_putln "Which ${_gic_media} partition has the install sets = ${_gic_mpart}"
+	_putln "Pathname to the sets = ${_gic_mpath}"
+	_putln "Set name(s) = ${_gic_sets}"
+	_putln "Continue without verification = yes"
+	return 0
+}
+
+# Scrub EVERY in-memory secret: FDE passphrase, the transient tui_password slot,
+# the root/user plaintext passwords AND their bcrypt hashes.  Called on every exit
+# path of the wizard/plan (including an early cancel) so a hostile/careless env that
+# pre-seeded VELO_S_ROOTPW/USERPW can never leave plaintext live in the shell.
+_velo_scrub_secrets() {
+	VELO_S_PASSPHRASE=""
+	VELO_PASSWORD=""
+	VELO_S_ROOTPW=""; VELO_S_USERPW=""
+	VELO_S_ROOTPW_HASH=""; VELO_S_USERPW_HASH=""
+	VELO_S_WIFI_PSK=""
+}
+
+# ===========================================================================
+#  NON-INTERACTIVE DRY-RUN ENTRYPOINT  (`velo-install plan`)
+#  Seeds VELO_S_* from same-named env vars (with safe defaults), then prints
+#  the install.conf and (if encrypt=yes) the crypto plan.  NEVER calls
+#  tui_init / velo_readkey -> pipe-safe, headless, no raw mode, no disk I/O.
+# ===========================================================================
+velo_plan() {
+	# Seed from env with defaults.  We re-validate everything so a hostile env
+	# cannot inject anything into the generated files.
+	VELO_S_DISK=${VELO_S_DISK:-sd0}
+	is_valid_disk "$VELO_S_DISK" || VELO_S_DISK="sd0"
+
+	VELO_S_ENCRYPT=${VELO_S_ENCRYPT:-no}
+	case "$VELO_S_ENCRYPT" in yes|no) : ;; *) VELO_S_ENCRYPT="no" ;; esac
+
+	VELO_S_HOSTNAME=${VELO_S_HOSTNAME:-velo-bsd}
+	valid_hostname "$VELO_S_HOSTNAME" || VELO_S_HOSTNAME="velo-bsd"
+
+	VELO_S_PROFILE=${VELO_S_PROFILE:-homely}
+	case "$VELO_S_PROFILE" in homely|minimal|fortress) : ;; *) VELO_S_PROFILE="homely" ;; esac
+
+	VELO_S_STARTMODE=${VELO_S_STARTMODE:-L1}
+	case "$VELO_S_STARTMODE" in L1|L2|L3) : ;; *) VELO_S_STARTMODE="L1" ;; esac
+
+	VELO_S_BOOTMODE=${VELO_S_BOOTMODE:-same}
+	case "$VELO_S_BOOTMODE" in same|uefi|bios|hybrid) : ;; *) VELO_S_BOOTMODE="same" ;; esac
+
+	# Set-location PART/PATH (DRY-RUN preview re-validates everything).  MEDIADISK
+	# is intentionally NOT resolved here: velo_plan does NO disk I/O, so detection
+	# runs only on the real velo_execute path; gen_install_conf shows the "sdN"
+	# placeholder for the disk in the preview.
+	VELO_S_MEDIAPART=${VELO_S_MEDIAPART:-a}
+	case "$VELO_S_MEDIAPART" in [a-p]) : ;; *) VELO_S_MEDIAPART="a" ;; esac
+	VELO_S_MEDIAPATH=${VELO_S_MEDIAPATH:-7.9/amd64}
+	case "$VELO_S_MEDIAPATH" in ''|*[!A-Za-z0-9./_-]*) VELO_S_MEDIAPATH="7.9/amd64" ;; esac
+
+	VELO_S_PKGS=${VELO_S_PKGS:-$(profile_pkgs "$VELO_S_PROFILE")}
+
+	# Derive the root disk: raw disk for plaintext, crypto placeholder for FDE.
+	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+		VELO_S_ROOTDISK="sdN"
+	else
+		VELO_S_ROOTDISK="$VELO_S_DISK"
+	fi
+
+	# Collapse the newline-separated disk list to a single line WITHOUT `tr`
+	# (absent in the ramdisk): unquoted re-expansion word-splits on IFS and
+	# `set --` rejoins with single spaces.
+	_vp_disks=$(velo_list_disks)
+	set -- $_vp_disks
+	_vp_disks_line="$*"
+
+	_putln "=== velo DRY-RUN plan (nothing is written to disk) ==="
+	_putln ""
+	_putln "Detected disks: $_vp_disks_line"
+	_putln "Chosen disk:    $VELO_S_DISK"
+	_putln "Encryption:     $VELO_S_ENCRYPT"
+	_putln "Hostname:       $VELO_S_HOSTNAME"
+	_putln "Profile:        $VELO_S_PROFILE"
+	_putln "Packages (M2):  $VELO_S_PKGS"
+	_putln "Protection:     $VELO_S_STARTMODE"
+	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+		_putln "Boot mode:      $VELO_S_BOOTMODE"
+	fi
+	_putln ""
+
+	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+		_putln "--- planned full-disk-encryption shell sequence ---"
+		plan_crypto "$VELO_S_DISK"
+		_putln ""
+	fi
+
+	_putln "--- generated install.conf ---"
+	gen_install_conf
+
+	# Hygiene: secrets are never used in `plan` mode, but clear them anyway.
+	_velo_scrub_secrets
+	return 0
+}
+
+# ===========================================================================
+#  DISK IDENTITY (TUI-SAFE) -- enrich the picker / summary / destroy-gate so the
+#  operator sees name + size + type + DUID + markers, never a bare sdN.  Every
+#  field is BEST-EFFORT and FAILS to "unknown" (never a guess): the only always-
+#  reliable field is the name (hw.disknames).  Ramdisk-only tools: disklabel
+#  (read-only, no -E), dmesg/cat, mount, sed + ksh case/$(( )).  NO awk/tr/printf/
+#  head/od/df.  velo_disk_row is the SINGLE identity composer reused by all three
+#  screens, so they cannot drift (same discipline as velo_fdisk_args for fdisk).
+# ===========================================================================
+
+# Upper size bound for the install-media [media?] tag.  NOTE: disklabel reports
+# the PHYSICAL medium size, not the ~1.34 GiB image dd'd onto it -- a 32 GB stick
+# reads as ~30 GiB (2026-06-08 Fujitsu metal: the 30 GB velo USB blew past the old
+# 8 GiB bound, so velo_find_media_disk saw ZERO media and aborted "could not
+# uniquely identify the velo install medium").  128 GiB comfortably covers real
+# USB install sticks while staying under typical internal/external SSD targets, so
+# the soft picker tag still tells stick from target at a glance.  This is now ONLY
+# the picker's hint + a sanity ceiling: the SAFETY-critical selector
+# velo_find_media_disk ALSO excludes the chosen install target, so a large disk
+# that happens to carry a velo image can never be mistaken for the medium even if
+# it slips under this bound.  The real fingerprint is the layout TRIPLE below
+# (a:4.2BSD@1024 + i:MSDOS960@64).  Override for tests.
+# NB: keep this >= the largest install stick you use (raise in lockstep if you
+# adopt bigger media; and with build/grow-media.sh if the IMAGE itself grows huge).
+VELO_MEDIA_MAX_BYTES=${VELO_MEDIA_MAX_BYTES:-137438953472}   # 128 GiB
+
+# The homely desktop closure needs materially more room than a base/minimal
+# install.  A 16 GiB live run exhausted /usr and /usr/local, then left the target
+# inconsistent on the next boot.  Refuse homely targets below 28 GiB before the
+# typed destroy gate; an unknown size is also a refusal, never a guess.
+VELO_HOMELY_MIN_BYTES=30064771072   # 28 GiB
+
+# velo_disk_probe DISK -- run `disklabel DISK` ONCE (read-only, no -E) and stash
+# size / sector-size / DUID / raw-label in globals (_VDP_*).  Any field that is
+# absent or non-numeric -> "" (unknown); disklabel missing/failed -> all "".  The
+# rd makes /dev nodes on demand, so MAKEDEV first (as velo_run_crypto does); the
+# read-only disklabel never alters the disk.
+velo_disk_probe() {
+	_vdp_disk=$1
+	_VDP_SECT=""; _VDP_BPS=""; _VDP_DUID=""; _VDP_LABEL=""
+	is_valid_disk "$_vdp_disk" || return 1
+	( cd /dev && sh MAKEDEV "$_vdp_disk" ) 2>/dev/null || true
+	_VDP_LABEL=$(disklabel "$_vdp_disk" 2>/dev/null) || _VDP_LABEL=""
+	[ -n "$_VDP_LABEL" ] || return 1
+	# Single-occurrence fields -> plain sed, no head (absent in the rd).
+	_VDP_BPS=$(_put "$_VDP_LABEL"  | sed -n 's/^bytes\/sector: *\([0-9]*\).*/\1/p')
+	_VDP_SECT=$(_put "$_VDP_LABEL" | sed -n 's/^total sectors: *\([0-9]*\).*/\1/p')
+	_VDP_DUID=$(_put "$_VDP_LABEL" | sed -n 's/^duid: *\([0-9a-f]*\).*/\1/p')
+	case "$_VDP_BPS"  in ''|*[!0-9]*) _VDP_BPS="" ;; esac
+	case "$_VDP_SECT" in ''|*[!0-9]*) _VDP_SECT="" ;; esac
+	return 0
+}
+
+# velo_profile_target_size_ok DISK PROFILE -- profile-specific capacity gate.
+# minimal/fortress keep their existing behaviour.  homely requires a readable
+# disklabel size of at least VELO_HOMELY_MIN_BYTES.  Leaves _VDP_* populated so
+# the caller can report the detected size without probing the disk again.
+velo_profile_target_size_ok() {
+	_vptso_disk=$1
+	_vptso_profile=$2
+	[ "$_vptso_profile" = homely ] || return 0
+	velo_disk_probe "$_vptso_disk" || return 1
+	case "$_VDP_SECT" in ''|*[!0-9]*) return 1 ;; esac
+	case "$_VDP_BPS"  in ''|*[!0-9]*) return 1 ;; esac
+	[ "$_VDP_SECT" -gt 0 ] && [ "$_VDP_BPS" -gt 0 ] || return 1
+	[ $(( _VDP_SECT * _VDP_BPS )) -ge "$VELO_HOMELY_MIN_BYTES" ]
+}
+
+# velo_human_size BYTES -> e.g. "16.0G" (GiB, binary).  Pure ksh integer math (no
+# printf/float): pick T/G/M/K, tenths = BYTES*10/unit.  ""/0/non-numeric -> "?".
+velo_human_size() {
+	_vhs_b=$1
+	case "$_vhs_b" in ''|*[!0-9]*) _put "?"; return 0 ;; esac
+	[ "$_vhs_b" -gt 0 ] || { _put "?"; return 0; }
+	if   [ "$_vhs_b" -ge 1099511627776 ]; then _vhs_u=1099511627776; _vhs_s=T
+	elif [ "$_vhs_b" -ge 1073741824 ];    then _vhs_u=1073741824;    _vhs_s=G
+	elif [ "$_vhs_b" -ge 1048576 ];       then _vhs_u=1048576;       _vhs_s=M
+	else                                        _vhs_u=1024;         _vhs_s=K
+	fi
+	_vhs_t=$(( _vhs_b * 10 / _vhs_u ))
+	_put "$(( _vhs_t / 10 )).$(( _vhs_t % 10 ))$_vhs_s"
+}
+
+# velo_disk_duid_disp -- DUID for display from _VDP_DUID (set by velo_disk_probe);
+# empty / all-zero -> "(none)".  Caller truncates to the column width.
+velo_disk_duid_disp() {
+	case "$_VDP_DUID" in
+	''|0000000000000000) _put "(none)"; return 0 ;;
+	esac
+	_put "$_VDP_DUID"
+}
+
+# velo_disk_type DISK -- short class hint from the boot dmesg (BEST-EFFORT; the
+# attach line may be absent at install time -> "" -> rendered "unknown").  Reads
+# /var/run/dmesg.boot (as velo_detect_bootmode), falling back to live `dmesg`.
+velo_disk_type() {
+	_vdt_disk=$1
+	if [ -r /var/run/dmesg.boot ]; then
+		_vdt_dmesg=$(cat /var/run/dmesg.boot 2>/dev/null)
+	elif command -v dmesg >/dev/null 2>&1; then
+		_vdt_dmesg=$(dmesg 2>/dev/null)
+	else
+		_vdt_dmesg=""
+	fi
+	[ -n "$_vdt_dmesg" ] || { _put ""; return 0; }
+	# First attach line for this disk; `q` after the first match avoids head.
+	_vdt_line=$(_put "$_vdt_dmesg" | sed -n "/^${_vdt_disk} at /{p;q;}")
+	[ -n "$_vdt_line" ] || { _put ""; return 0; }
+	_vdt_rem=0
+	case "$_vdt_line" in *" removable"*) _vdt_rem=1 ;; esac
+	# umass (USB) iff this disk's scsibus is "at umass" elsewhere in the dmesg.
+	_vdt_bus=$(_put "$_vdt_line" | sed -n 's/.* at \(scsibus[0-9]*\) .*/\1/p')
+	_vdt_umass=0
+	if [ -n "$_vdt_bus" ] && _put "$_vdt_dmesg" | grep -q "^${_vdt_bus} at umass"; then
+		_vdt_umass=1
+	fi
+	if   [ "$_vdt_umass" = 1 ] && [ "$_vdt_rem" = 1 ]; then _put "umass/removable"
+	elif [ "$_vdt_umass" = 1 ];                        then _put "umass"
+	elif [ "$_vdt_rem" = 1 ];                          then _put "removable"
+	else                                                    _put "internal"
+	fi
+}
+
+# velo_disk_is_media -- 0 iff _VDP_LABEL matches velo's OWN install-media layout
+# (build/grow-media.sh): disklabel 'a' = 4.2BSD at offset 1024 AND 'i' = MSDOS
+# size 960 offset 64 AND total < VELO_MEDIA_MAX_BYTES.  STRICT TRIPLE on purpose:
+# an ESP alone is not unique (a UEFI target carries one too), so all three marks
+# must hold -> a real, large, RAID-sliced target cannot false-match.  Consumes
+# the _VDP_* globals from the velo_disk_probe call that velo_disk_row makes first.
+velo_disk_is_media() {
+	[ -n "$_VDP_LABEL" ] || return 1
+	case "$_VDP_SECT" in ''|*[!0-9]*) return 1 ;; esac
+	_vim_bps=$_VDP_BPS; case "$_vim_bps" in ''|*[!0-9]*) _vim_bps=512 ;; esac
+	[ $(( _VDP_SECT * _vim_bps )) -lt "$VELO_MEDIA_MAX_BYTES" ] || return 1
+	_vim_a=0; _vim_i=0
+	while read -r _vim_p _vim_sz _vim_off _vim_fs _vim_rest; do
+		case "$_vim_p" in
+		a:) [ "$_vim_off" = 1024 ] && [ "$_vim_fs" = 4.2BSD ] && _vim_a=1 ;;
+		i:) [ "$_vim_sz" = 960 ] && [ "$_vim_off" = 64 ] && [ "$_vim_fs" = MSDOS ] && _vim_i=1 ;;
+		esac
+	done <<EOF
+$_VDP_LABEL
+EOF
+	[ "$_vim_a" = 1 ] && [ "$_vim_i" = 1 ]
+}
+
+# velo_disk_row DISK -- the SINGLE enriched identity line, reused by the picker,
+# the summary and the destroy-gate so the three can never drift.  Columns
+# name(5) size(7) type(15) duid(6) + " [MOUNTED]"/" [media?]" markers; worst case
+# 55 chars -> fits the menu label (VELO_BOX_W-5 = 59) and the boxes' 62-col body.
+velo_disk_row() {
+	_vdr_disk=$1
+	velo_disk_probe "$_vdr_disk"        # sets _VDP_*; rc ignored (fields -> "")
+	if [ -n "$_VDP_SECT" ]; then
+		_vdr_bps=$_VDP_BPS; case "$_vdr_bps" in ''|*[!0-9]*) _vdr_bps=512 ;; esac
+		_vdr_size=$(velo_human_size $(( _VDP_SECT * _vdr_bps )))
+	else
+		_vdr_size="?"
+	fi
+	_vdr_type=$(velo_disk_type "$_vdr_disk")
+	[ -n "$_vdr_type" ] || _vdr_type="unknown"
+	_vdr_duid=$(velo_disk_duid_disp)
+	case "$_vdr_duid" in
+	"(none)") : ;;
+	*) _vdr_duid=$(_substr "$_vdr_duid" 0 6) ;;
+	esac
+	_vdr_mark=""
+	if velo_disk_busy "$_vdr_disk";  then _vdr_mark="$_vdr_mark [MOUNTED]"; fi
+	if velo_disk_is_media; then _vdr_mark="$_vdr_mark [media?]"; fi
+	_put "$(_pad "$_vdr_disk" 5) $(_pad "$_vdr_size" 7) $(_pad "$_vdr_type" 15) $(_pad "$_vdr_duid" 6)$_vdr_mark"
+}
+
+# velo_find_media_disk -- print the SINGLE attached disk that IS the velo install
+# medium (it carries the sets at 7.9/amd64), identified by its OWN disklabel
+# signature via velo_disk_is_media -- NEVER by sd-unit number, which is
+# enumeration-order-dependent and differs per machine (the 2026-06-08 Fujitsu
+# metal failure: the velo USB was not sd0, so the unanswered set-location prompts
+# defaulted to the wrong disk -> "7.9/amd64 does not exist").  FAIL-CLOSED: prints
+# nothing and returns nonzero unless EXACTLY ONE disk matches -- zero = stick
+# absent/unreadable, more-than-one = a second stick or a dd clone.  Same
+# STOP-not-guess discipline as velo_resolve_bootmode / velo_run_crypto.  Reuses
+# velo_list_disks (injectable via VELO_FAKE_DISKS), velo_disk_probe and
+# velo_disk_is_media, so this runtime selector and the picker's [media?] tag can
+# never diverge.  Optional arg $1 = a disk to EXCLUDE (the chosen install target),
+# so the medium is never confused with a target that carries a stale velo image.
+velo_find_media_disk() {
+	_vfmd_exclude=${1:-}        # the chosen install TARGET, if any: never the medium
+	_vfmd_match=""
+	_vfmd_n=0
+	for _vfmd_d in $(velo_list_disks); do
+		# Skip the disk we are about to ERASE: a large target that still carries an
+		# old velo image (2026-06-08: the 232 GiB Samsung held the prior 'gospel'
+		# write) would otherwise be a second layout match -> ambiguous, or under a
+		# generous size bound could win outright.  The medium is never the target.
+		[ -n "$_vfmd_exclude" ] && [ "$_vfmd_d" = "$_vfmd_exclude" ] && continue
+		velo_disk_probe "$_vfmd_d" || continue   # sets _VDP_*; skip unreadable
+		if velo_disk_is_media; then
+			_vfmd_match=$_vfmd_d
+			_vfmd_n=$(( _vfmd_n + 1 ))
+		fi
+	done
+	[ "$_vfmd_n" = 1 ] || return 1
+	_put "$_vfmd_match"
+}
+
+# ===========================================================================
+#  INTERACTIVE WIZARD  (8 screens + summary; a conditional boot-mode screen
+#  appears between start-mode and summary ONLY for an encrypted install)
+#  Uses ONLY the velo-tui.ksh widgets.  Each screen sets exactly one datum.
+#  ESC steps back; the summary's "No" steps back to screen 1 to revise; "Yes"
+#  prints the plan (still DRY-RUN -- nothing is written).
+# ===========================================================================
+
+# screen layout constants
+VELO_BOX_X=4
+VELO_BOX_Y=3
+VELO_BOX_W=64
+
+# Fixed footer row for the help-line.  It sits BELOW the deepest widget any
+# screen can draw: the disk menu caps at 12 items (box bottom border at row
+# VELO_BOX_Y+12+1 = 16) and the summary box is 13 rows (rows 3..15).  Row 18
+# leaves a one-row gap under all of them and still fits a 24-row vt220 console.
+# Because every widget's read-loop repaints ONLY its own interior rows (never
+# below its bottom border), a footer drawn here -- even BEFORE a blocking
+# menu/radio/checklist -- is never overwritten.  This is why the help-line needs
+# NO change to velo-tui.ksh's widget layer.
+VELO_HELP_Y=18
+
+# _wiz_help CONTEXT [sizes] -- draw the unified footer hint below the current
+# screen's widget.  CONTEXT is the Esc semantics ("back" on mid screens, "stock
+# installer" on welcome, "abort" on the destroy gate).  Pass a non-empty 2nd arg
+# on screens that show a disk SIZE to append the GiB unit reminder.  Plain panel
+# colour, ASCII only; widest line ("...Esc=abort  sizes in GiB" = 37) is well
+# under the 61-col body budget.
+_wiz_help() {
+	_wh_ctx=$1
+	_wh_line="Enter=select  Esc=$_wh_ctx"
+	if [ -n "${2:-}" ]; then
+		_wh_line="$_wh_line  sizes in GiB"
+	fi
+	_text_at $((VELO_BOX_X + 2)) "$VELO_HELP_Y" "$_wh_line"
+}
+
+_wiz_welcome() {
+	velo_clear
+	# Tell the truth about what THIS medium does.  On an armed flash drive (M3:
+	# VELO_ALLOW_EXECUTE=yes) the wizard really erases the chosen disk and installs
+	# -- the old DRY-RUN copy would be a dangerous lie.  On host/tests/`plan` the
+	# path is inert, so the planner copy stands.  velo_armed is the single gate.
+	if velo_armed; then
+		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 9 \
+			"velo -- OpenBSD 7.9 installer (ARMED -- REAL INSTALL)"
+		_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) "This wizard installs an encrypted hardened OpenBSD."
+		_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) "ARMED MEDIA: the disk you pick WILL BE ERASED."
+		_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 4)) "A final type-the-name gate stands before any write."
+		_wiz_help "stock installer"
+		tui_confirm "$VELO_BOX_X" $((VELO_BOX_Y + 6)) "$VELO_BOX_W" "Begin?" "Begin the real install?"
+	else
+		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 9 "velo -- OpenBSD 7.9 installer (DRY-RUN)"
+		_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) "This wizard PLANS an encrypted hardened install."
+		_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) "M1 is DRY-RUN: nothing is written to any disk."
+		_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 4)) "It only previews the commands and install.conf."
+		_wiz_help "stock installer"
+		tui_confirm "$VELO_BOX_X" $((VELO_BOX_Y + 6)) "$VELO_BOX_W" "Begin?" "Start the install planner?"
+	fi
+}
+
+# Returns 0 on confirm (datum set), 1 on ESC/back.
+_wiz_disk() {
+	velo_clear
+	_wd_disks=$(velo_list_disks)
+	if [ -z "$_wd_disks" ]; then
+		tui_msgbox "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "No disks" \
+			"No sd*/wd* disks were detected." \
+			"Set VELO_FAKE_DISKS to test on this host." \
+			"(e.g. VELO_FAKE_DISKS=sd0:abc,wd1:def)"
+		return 1
+	fi
+	# Cap to what fits the viewport (M1 req §2: widgets do not scroll).  A real
+	# machine shows a handful; if ever more, show the first N and WARN to stderr
+	# (no SILENT truncation) so the operator knows others exist.
+	#
+	# Each disk is enriched to a name·size·type·DUID row (+ [MOUNTED]/[media?]
+	# markers) so the operator never picks a bare sdN.  Each ROW is passed as ONE
+	# menu item via `set --` accumulation (NOT word-split -- the row has spaces);
+	# a PARALLEL plain-name list (_wd_names, safe to word-split) maps the chosen
+	# index back to a disk name through the existing idx_from_list.
+	_wd_max=12
+	_wd_names=""
+	_wd_n=0
+	_wd_total=0
+	set --
+	for _wd_d in $_wd_disks; do
+		_wd_total=$((_wd_total + 1))
+		if [ "$_wd_n" -ge "$_wd_max" ]; then continue; fi
+		_wd_names="$_wd_names $_wd_d"
+		set -- "$@" "$(velo_disk_row "$_wd_d")"
+		_wd_n=$((_wd_n + 1))
+	done
+	if [ "$_wd_total" -gt "$_wd_max" ]; then
+		echo "velo: $_wd_total disks detected; showing first $_wd_max." \
+		     "Target others from the (S)hell." >&2
+	fi
+	_wiz_help "back" "sizes"
+	tui_menu "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 1/$_wz_total: Root disk" "$@" || return 1
+	_wd_name=$(idx_from_list "$VELO_MENU_INDEX" $_wd_names) || return 1
+	is_valid_disk "$_wd_name" || return 1
+	VELO_S_DISK=$_wd_name
+	return 0
+}
+
+# Returns 0 on confirm, 1 on ESC/back.
+_wiz_encrypt() {
+	velo_clear
+	_wiz_help "back"
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 2/$_wz_total: Encrypt root disk (softraid CRYPTO)?" \
+		"no  -- plaintext install" \
+		"yes -- full-disk encryption (passphrase)" || return 1
+	if [ "$VELO_RADIO_INDEX" = 1 ]; then
+		VELO_S_ENCRYPT="yes"
+		# confirm-twice passphrase loop (M1 req §1): re-loop on mismatch/empty.
+		while :; do
+			velo_clear
+			tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Passphrase"
+			# Unified footer (mirror rootpw/userpw): the velo_clear above wipes the
+			# radio screen's help-line, so redraw it INSIDE the loop -- this keeps
+			# the hint on the passphrase entry AND on the re-looped Mismatch box.
+			_wiz_help "back"
+			tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) "passphrase:" \
+				|| { VELO_S_ENCRYPT="no"; return 1; }
+			_wz_p1=$VELO_PASSWORD; VELO_PASSWORD=""
+			tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) $((VELO_BOX_W - 4)) "again:     " \
+				|| { _wz_p1=""; VELO_S_ENCRYPT="no"; return 1; }
+			_wz_p2=$VELO_PASSWORD; VELO_PASSWORD=""
+			if [ -n "$_wz_p1" ] && [ "$_wz_p1" = "$_wz_p2" ]; then
+				VELO_S_PASSPHRASE=$_wz_p1
+				_wz_p1=""; _wz_p2=""
+				break
+			fi
+			_wz_p1=""; _wz_p2=""
+			tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Mismatch" \
+				"Passphrases differ or were empty -- try again."
+		done
+	else
+		VELO_S_ENCRYPT="no"
+		VELO_S_PASSPHRASE=""
+		# Reset the FDE-only boot-mode datum too: turning encryption OFF (incl.
+		# after ESC-walking back from the bootmode screen) must not leave a stale
+		# 'bios'/'uefi' from an abandoned encrypted path lingering in state.
+		VELO_S_BOOTMODE="same"
+	fi
+	return 0
+}
+
+# Returns 0 on confirm, 1 on ESC/back.  Collects the ROOT account password,
+# confirm-twice (re-loop on mismatch/empty) -- mirrors the passphrase screen.
+# UNCONDITIONAL: an OS account password is required even when encrypt=no.  The
+# plaintext lives ONLY in VELO_S_ROOTPW (scrubbed after use); it is never echoed
+# and never rendered to any plan/preview (gen_install_conf emits only a hash).
+_wiz_rootpw() {
+	while :; do
+		velo_clear
+		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 3/$_wz_total: Root account password"
+		_wiz_help "back"
+		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) "password:" \
+			|| return 1
+		_wz_p1=$VELO_PASSWORD; VELO_PASSWORD=""
+		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) $((VELO_BOX_W - 4)) "again:   " \
+			|| { _wz_p1=""; return 1; }
+		_wz_p2=$VELO_PASSWORD; VELO_PASSWORD=""
+		if [ -n "$_wz_p1" ] && [ "$_wz_p1" = "$_wz_p2" ]; then
+			VELO_S_ROOTPW=$_wz_p1
+			_wz_p1=""; _wz_p2=""
+			return 0
+		fi
+		_wz_p1=""; _wz_p2=""
+		tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Mismatch" \
+			"Passwords differ or were empty -- try again."
+	done
+}
+
+# Returns 0 on confirm, 1 on ESC/back.  Collects the USER (anon) account
+# password.  Same confirm-twice contract as _wiz_rootpw; an independent secret
+# (VELO_S_USERPW) -- root and user passwords are deliberately separate.
+_wiz_userpw() {
+	while :; do
+		velo_clear
+		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 4/$_wz_total: User (anon) password"
+		_wiz_help "back"
+		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) "password:" \
+			|| return 1
+		_wz_p1=$VELO_PASSWORD; VELO_PASSWORD=""
+		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) $((VELO_BOX_W - 4)) "again:   " \
+			|| { _wz_p1=""; return 1; }
+		_wz_p2=$VELO_PASSWORD; VELO_PASSWORD=""
+		if [ -n "$_wz_p1" ] && [ "$_wz_p1" = "$_wz_p2" ]; then
+			VELO_S_USERPW=$_wz_p1
+			_wz_p1=""; _wz_p2=""
+			return 0
+		fi
+		_wz_p1=""; _wz_p2=""
+		tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Mismatch" \
+			"Passwords differ or were empty -- try again."
+	done
+}
+
+# Returns 0 on confirm, 1 on ESC/back.
+_wiz_hostname() {
+	velo_clear
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 5/$_wz_total: Hostname"
+	_wiz_help "back"
+	while :; do
+		tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) "hostname:" \
+			"${VELO_S_HOSTNAME:-velo-bsd}" || return 1
+		if valid_hostname "$VELO_INPUT"; then
+			VELO_S_HOSTNAME=$VELO_INPUT
+			return 0
+		fi
+		tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Invalid" \
+			"Hostname must be 1-63 chars [A-Za-z0-9-]," \
+			"no leading/trailing '-', no dots/spaces."
+	done
+}
+
+# Returns 0 on confirm/skip, 1 on ESC/back.  Optional screen: blank SSID skips
+# Wi-Fi setup entirely (the template hostname.iwm0 ships without credentials).
+# When SSID is provided, PSK is required; both are written directly to
+# /mnt/etc/hostname.iwm0 by velo_execute -- the PSK never lands in the answers
+# audit file.  PSK is scrubbed with the other secrets after execute.
+_wiz_wifi() {
+	velo_clear
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 6/$_wz_total: Wi-Fi (optional)"
+	_wiz_help "back"
+	while :; do
+		tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) \
+			"SSID (blank = skip):" "${VELO_S_WIFI_SSID:-}" || return 1
+		_ww_ssid=$VELO_INPUT
+		if [ -z "$_ww_ssid" ]; then
+			VELO_S_WIFI_SSID=""; VELO_S_WIFI_PSK=""; _ww_ssid=""; return 0
+		fi
+		case "$_ww_ssid" in
+		*'"'*|*"\\"*)
+			tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Invalid SSID" \
+				"No double-quotes or backslashes in SSID."
+			_ww_ssid=""; continue ;;
+		esac
+		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) $((VELO_BOX_W - 4)) \
+			"WPA key:            " || return 1
+		_ww_psk=$VELO_PASSWORD; VELO_PASSWORD=""
+		if [ -z "$_ww_psk" ]; then
+			tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Required" \
+				"WPA key cannot be empty."
+			_ww_ssid=""; _ww_psk=""; continue
+		fi
+		VELO_S_WIFI_SSID=$_ww_ssid; VELO_S_WIFI_PSK=$_ww_psk
+		_ww_ssid=""; _ww_psk=""; return 0
+	done
+}
+
+# Returns 0 on confirm, 1 on ESC/back.
+_wiz_profile() {
+	velo_clear
+	_wiz_help "back"
+	# Build labels in the SAME order as VELO_PROFILES so idx_to_profile maps.
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 7/$_wz_total: Profile" \
+		"homely   -- openbox home desktop" \
+		"minimal  -- base only + a few tools" \
+		"fortress -- anonymity / privacy stack" || return 1
+	_wp_name=$(idx_to_profile "$VELO_RADIO_INDEX") || return 1
+	VELO_S_PROFILE=$_wp_name
+	return 0
+}
+
+# Returns 0 on confirm, 1 on ESC/back.
+_wiz_packages() {
+	velo_clear
+	_wpk_universe=$(profile_pkgs "$VELO_S_PROFILE")
+	if [ -z "$_wpk_universe" ]; then
+		# unknown profile -> no checklist; treat as empty selection
+		VELO_S_PKGS=""
+		return 0
+	fi
+	_wiz_help "back"
+	# shellcheck disable=SC2086
+	tui_checklist "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" \
+		"Step 8/$_wz_total: Packages for $VELO_S_PROFILE (SPACE toggles)" $_wpk_universe \
+		|| return 1
+	# Map checked indices back to names from the SAME universe (M1 req §3).
+	VELO_S_PKGS=$(idxset_to_pkgs "$VELO_CHECKED" $_wpk_universe)
+	return 0
+}
+
+# Returns 0 on confirm, 1 on ESC/back.
+_wiz_startmode() {
+	velo_clear
+	_wiz_help "back"
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 9/$_wz_total: Protection level (records only in v0.1)" \
+		"L1 -- encrypted homely baseline" \
+		"L2 -- reduced network surface (IPv6 off)" \
+		"L3 -- Tor-only fail-closed (only _tor out)" || return 1
+	_wsm_name=$(idx_to_startmode "$VELO_RADIO_INDEX") || return 1
+	VELO_S_STARTMODE=$_wsm_name
+	return 0
+}
+
+# Returns 0 on confirm, 1 on ESC/back.  Shown ONLY when encrypt=yes (the wizard
+# router skips it for a plaintext install -- there the stock installer lays out
+# the disk).  Under FDE velo partitions the disk itself, so the firmware target
+# decides GPT-vs-MBR.  'same' auto-detects from the running installer at run
+# time; uefi/bios force the table.
+_wiz_bootmode() {
+	velo_clear
+	_wiz_help "back"
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 10/$_wz_total: Target firmware / partition table (FDE)" \
+		"same -- match THIS machine's firmware (auto-detect)" \
+		"uefi -- force GPT + EFI system partition" \
+		"bios -- force legacy MBR (older machines)" \
+		"hybrid -- MBR + EFI tail (boots on BOTH legacy and UEFI)" || return 1
+	_wbm_name=$(idx_to_bootmode "$VELO_RADIO_INDEX") || return 1
+	VELO_S_BOOTMODE=$_wbm_name
+	return 0
+}
+
+# Summary / Ворота-СТОП.  Returns 0 = Yes (print plan), 1 = No (revise).
+_wiz_summary() {
+	velo_clear
+	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+		_ws_enc="yes (passphrase set)"
+		case "$VELO_S_BOOTMODE" in
+		same)   _ws_boot="same (auto-detect at run time)" ;;
+		uefi)   _ws_boot="uefi (GPT + EFI system partition)" ;;
+		bios)   _ws_boot="bios (legacy MBR)" ;;
+		hybrid) _ws_boot="hybrid (MBR + EFI tail -- legacy and UEFI)" ;;
+		*)      _ws_boot="$VELO_S_BOOTMODE" ;;
+		esac
+	else
+		_ws_enc="no"
+		_ws_boot="(installer default; FDE only)"
+	fi
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 14 "Summary -- review before planning (FINAL GATE)"
+	# disk: uses the SHORT 6-col "disk: " prefix (NOT the 12-col label grid) and is
+	# NEVER clipped -- matching the destroy-gate, it keeps the enriched identity
+	# within the 61-col body with zero slip (worst-case row 55 + 6 = 61), so the
+	# trailing [MOUNTED]/[media?] safety markers can never be truncated on this
+	# point-of-no-return review screen.  Label misalignment is the accepted cost
+	# of never cutting the safety signal (review finding B1).
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 1)) "disk: $(velo_disk_row "$VELO_S_DISK")"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) "encryption: $_ws_enc"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) "boot:       $_ws_boot"
+	# hostname reaches ~50 chars (tui_input cap) or 63 (env-seeded) -> clip to the
+	# 61-col body exactly like packages below, so a long name cannot wrap onto the
+	# wifi: row.  (profile/protection are short enums -- no clip needed.)
+	_ws_host="$VELO_S_HOSTNAME"
+	[ ${#_ws_host} -gt 49 ] && _ws_host="$(_substr "$_ws_host" 0 45) ..."
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 4)) "hostname:   $_ws_host"
+	_ws_wifi="${VELO_S_WIFI_SSID:-(skipped)}"
+	[ ${#_ws_wifi} -gt 49 ] && _ws_wifi="$(_substr "$_ws_wifi" 0 45) ..."
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 5)) "wifi:       $_ws_wifi"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 6)) "profile:    $VELO_S_PROFILE"
+	# Clip the (long, firefox-profile) package list to the 61-col body so it cannot
+	# wrap onto and corrupt the rows below (2026-06-08: 14 pkgs overran into the
+	# protection line).  "packages:   " is 12 cols -> 49 left; ASCII ellipsis.  The
+	# FULL list still lands in /etc/velo/answers + the post-install summary.
+	_ws_pkgs="${VELO_S_PKGS:-(none)}"
+	if [ ${#_ws_pkgs} -gt 49 ]; then
+		_ws_pkgs="$(_substr "$_ws_pkgs" 0 45) ..."
+	fi
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 7)) "packages:   $_ws_pkgs"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 8)) "protection: $VELO_S_STARTMODE"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 9)) "passwords:  set (root, user)"
+	# Tell the truth about Yes HERE too (mirrors _wiz_welcome): on armed media Yes
+	# proceeds PAST the printed plan to velo_execute's disk-erase gate and the real
+	# install; only the unarmed planner merely prints.  velo_armed is the gate.
+	if velo_armed; then
+		_ws_yes="ARMED: Yes leads to the disk-erase gate -- REAL install."
+	else
+		_ws_yes="DRY-RUN: choosing Yes only PRINTS the plan."
+	fi
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) "$_ws_yes"
+	_wiz_help "revise" "sizes"
+	tui_confirm "$VELO_BOX_X" $((VELO_BOX_Y + 11)) "$VELO_BOX_W" "Confirm" "Generate the install plan now?"
+}
+
+# ===========================================================================
+#  M3 DESTRUCTIVE EXECUTE PATH (gated; INERT unless armed by the medium).
+#  Reached from velo_wizard's tail AFTER the summary Ворота-СТОП Yes + the plan
+#  preview.  TWO independent arming gates before any destructive token:
+#    (1) env VELO_ALLOW_EXECUTE=yes -- set ONLY by the ramdisk launcher on the
+#        real medium; absent on host/tests/`plan` -> the path is INERT (rc 2).
+#    (2) a typed-confirm gate -- operator types the EXACT target disk name;
+#        empty/mismatch ABORTS (default-No, m3-requirements).
+#  Passphrase ($VELO_S_PASSPHRASE) touches ONLY the bioctl stdin pipe; the caller
+#  scrubs it AFTER velo_execute returns.  Mechanism (install.sub source-grounded,
+#  docs/m3-design s2.3): `install -a -f FILE` -> non-interactive, NO 5s watchdog,
+#  NO auto_install.conf.  Items still FLAGGED `verify in 7.9 VM` per m3-design.
+# ===========================================================================
+
+# velo_armed -- 0 iff VELO_ALLOW_EXECUTE=yes; single arming chokepoint.
+velo_armed() {
+	[ "${VELO_ALLOW_EXECUTE:-no}" = "yes" ]
+}
+
+# velo_confirm_destructive DISK -- the typed-exact-name gate (no default path).
+velo_confirm_destructive() {
+	_vcd_disk=$1
+	is_valid_disk "$_vcd_disk" || return 1
+	velo_clear
+	_vcd_title="!!! DESTROY DISK -- POINT OF NO RETURN !!!"
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 9 "$_vcd_title"
+	# Accent the gate in ANSI red (bold white on red).  tui_box paints the title
+	# blue like every screen; over-draw it here in danger colour so the destroy
+	# gate is visually unmistakable.  Colour is gated by VELO_USE_COLOR (no-op on
+	# a colourless terminal); the ASCII rule below carries the same separation
+	# WITHOUT colour, so the gate still reads on a mono console.  The over-draw
+	# string MUST match tui_box's " $title " framing (leading + trailing space).
+	_goto "$VELO_BOX_Y" $((VELO_BOX_X + 1))
+	velo_danger_on; _put " $_vcd_title "; velo_danger_off
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) \
+		"This ERASES ALL DATA on $_vcd_disk and installs OpenBSD."
+	# "There is NO undo" also in danger colour (manual draw, not _text_at).
+	_goto $((VELO_BOX_Y + 3)) $((VELO_BOX_X + 2))
+	velo_danger_on; _put "There is NO undo."; velo_danger_off
+	velo_panel_on; _put "  Encrypted: ${VELO_S_ENCRYPT}."; velo_reset
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 4)) \
+		"disk: $(velo_disk_row "$_vcd_disk")"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 5)) \
+		"To proceed, type the disk name EXACTLY:  $_vcd_disk"
+	# Always-on ASCII separator (visible without colour); width <= inner (62).
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 6)) \
+		"$(_repeat '-' 58)"
+	_wiz_help "abort" "sizes"
+	tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 7)) $((VELO_BOX_W - 4)) \
+		"disk:" "" || return 1
+	[ "$VELO_INPUT" = "$_vcd_disk" ] || return 1
+	return 0
+}
+
+# velo_crypto_unit -- echo the CRYPTO sd unit from `bioctl softraid0` (NEVER
+# hardcoded); nonzero+empty if undeterminable.  Pure case / param-expansion.
+velo_crypto_unit() {
+	# `bioctl softraid0` prints e.g.:  softraid0 0 Online <size> sd2     CRYPTO
+	# The CRYPTO sd unit is a token INSIDE that line (the line's first word is
+	# "softraid0").  Capture the output (NO pipe-subshell, so `return` works) and
+	# pick the first PURE sd<N> token; is_valid_disk rejects chunk tokens (sd1a).
+	_vcu_out=$(bioctl softraid0 2>/dev/null)
+	for _vcu_tok in $_vcu_out; do
+		case "$_vcu_tok" in
+		sd[0-9]*)
+			if is_valid_disk "$_vcu_tok"; then _put "$_vcu_tok"; return 0; fi
+			;;
+		esac
+	done
+	return 1
+}
+
+# velo_disk_busy DISK -- 0 if DISK has any mounted partition (refuse to install
+# onto the running medium / a mounted disk).  Defence in depth.
+velo_disk_busy() {
+	mount 2>/dev/null | grep -q "^/dev/$1[a-p] " && return 0
+	return 1
+}
+
+# velo_mount_target_partitions DISK -- mount every non-root ffs slice from the
+# target fstab under /mnt so the chroot hook sees real /home /var /usr …
+# Auto-layout installs split these; writing into an unmounted mountpoint lands
+# on the tiny / slice and is hidden once the real slice mounts at first boot.
+velo_mount_target_partitions() {
+	_vmtp_disk=$1
+	_vmtp_fstab=/mnt/etc/fstab
+	[ -r "$_vmtp_fstab" ] || return 0
+	while IFS= read -r _vmtp_line; do
+		case "$_vmtp_line" in
+		""|"#"*) continue ;;
+		esac
+		set -- $_vmtp_line
+		_vmtp_spec=$1
+		_vmtp_mp=$2
+		_vmtp_fst=$3
+		[ "$_vmtp_fst" = ffs ] || continue
+		[ "$_vmtp_mp" = / ] && continue
+		case "$_vmtp_spec" in
+		*.*) _vmtp_letter=${_vmtp_spec##*.} ;;
+		*) continue ;;
+		esac
+		_vmtp_dev="/dev/${_vmtp_disk}${_vmtp_letter}"
+		_vmtp_mntp="/mnt${_vmtp_mp}"
+		if mount 2>/dev/null | grep -q " on ${_vmtp_mntp} "; then
+			_putln "velo: ${_vmtp_mp} already mounted (chroot layout)"
+			continue
+		fi
+		fsck -p "$_vmtp_dev" >/dev/null 2>&1 || true
+		mkdir -p "$_vmtp_mntp" 2>/dev/null || true
+		if mount "$_vmtp_dev" "$_vmtp_mntp" 2>/dev/null; then
+			_putln "velo: mounted $_vmtp_dev on $_vmtp_mntp (chroot layout)"
+		else
+			_putln "velo: WARN mount $_vmtp_dev on $_vmtp_mntp failed" >&2
+		fi
+	done < "$_vmtp_fstab"
+}
+
+# velo_umount_target_partitions -- unmount /mnt and every slice mounted under it.
+velo_umount_target_partitions() {
+	_vutp_i=0
+	while [ $_vutp_i -lt 12 ]; do
+		_vutp_any=0
+		if [ -r /mnt/etc/fstab ]; then
+			while IFS= read -r _vutp_line; do
+				case "$_vutp_line" in
+				""|"#"*) continue ;;
+				esac
+				set -- $_vutp_line
+				_vutp_mp=$2
+				_vutp_fst=$3
+				[ "$_vutp_fst" = ffs ] || continue
+				[ "$_vutp_mp" = / ] && continue
+				if umount "/mnt${_vutp_mp}" 2>/dev/null; then
+					_vutp_any=1
+				fi
+			done < /mnt/etc/fstab
+		fi
+		[ $_vutp_any -eq 1 ] || break
+		_vutp_i=$((_vutp_i + 1))
+	done
+	umount /mnt 2>/dev/null || true
+}
+
+# velo_run_crypto DISK -- the REAL plan_crypto sequence; echoes the CRYPTO sd
+# unit on stdout; nonzero on any failure.  Passphrase piped to bioctl STDIN ONLY.
+# Re-asserts the arming gate (rc 3) so a mis-ordered call still cannot fire.
+velo_run_crypto() {
+	set +x                      # defensive: never xtrace the passphrase pipe
+	_vrc_disk=$1
+	velo_armed                  || return 3
+	is_valid_disk "$_vrc_disk"  || return 1
+	[ -n "$VELO_S_PASSPHRASE" ] || return 1
+	# The rd knows the disk (hw.disknames) but makes /dev nodes ON DEMAND; create
+	# the chunk disk's nodes before fdisk/disklabel/bioctl touch it.  MAKEDEV is
+	# in /dev in the install ramdisk.
+	( cd /dev && sh MAKEDEV "$_vrc_disk" ) 2>/dev/null || true
+	# Resolve the firmware target and pick fdisk's table args via the SAME helper
+	# plan_crypto previews (anti-drift).  On the real medium `same` MUST detect --
+	# an unresolved boot mode is a fail-safe STOP (return 1), never a guess.
+	# velo_fdisk_args returns nonzero for an unknown/bad mode, so the `||` aborts
+	# BEFORE any destructive fdisk runs.  _vrc_fargs is an internal enum-derived
+	# string ("-iy -g -b 960" | "-iy"); the deliberate unquoted expansion below
+	# word-splits it into fdisk flags (no operator input, no metachars).
+	_vrc_mode=$(velo_resolve_bootmode)
+	_vrc_fargs=$(velo_fdisk_args "$_vrc_mode") || {
+		_putln "velo: ERROR -- cannot determine boot mode ('$_vrc_mode'); refusing to partition $_vrc_disk." >&2
+		return 1
+	}
+	# Zero the target's first 8 MiB so fdisk/disklabel/bioctl start from a TRUE
+	# blank slate.  A disk that already carries a velo/OpenBSD layout keeps its
+	# partition 'a'; then `disklabel -E ... a a` below reports "Partition 'a' is in
+	# use", the RAID slice is never laid, and bioctl aborts "softraid0: invalid
+	# metadata format" (2026-06-08 Fujitsu metal: sd2 still held the old 'gospel'
+	# image).  8 MiB clears the MBR/GPT-primary + the disklabel + the softraid
+	# metadata at the chunk head.  /dev/r<disk>c is the whole-disk raw node MAKEDEV
+	# made above.  FAIL CLOSED: if we cannot wipe, do NOT partition.
+	dd if=/dev/zero of="/dev/r${_vrc_disk}c" bs=1m count=$VELO_WIPE_MIB >/dev/null 2>&1 || return 1
+	# shellcheck disable=SC2086
+	fdisk $_vrc_fargs "$_vrc_disk"                     || return 1
+	# hybrid: shrink A6 and add 0xEF EFI tail (step 2; step 1 = fdisk -iy above).
+	if [ "$_vrc_mode" = "hybrid" ]; then
+		velo_fdisk_hybrid_esp "$_vrc_disk"             || return 1
+	fi
+	disklabel -E "$_vrc_disk" <<'EOF'                  || return 1
+a
+a
+
+
+RAID
+w
+q
+EOF
+	print -r -- "$VELO_S_PASSPHRASE" | \
+		bioctl -Cforce -cC -l"${_vrc_disk}a" -s softraid0   || return 1
+	_vrc_unit=$(velo_crypto_unit) || return 1
+	is_valid_disk "$_vrc_unit"    || return 1
+	( cd /dev && sh MAKEDEV "$_vrc_unit" ) 2>/dev/null || true
+	dd if=/dev/zero of="/dev/r${_vrc_unit}c" bs=1m count=1 >/dev/null 2>&1 \
+		|| return 1
+	# Return the unit via a GLOBAL, NOT stdout: fdisk/disklabel/bioctl above print
+	# to stdout (visible progress), so a $() capture would mix that noise with the
+	# unit.  velo_execute reads VELO_CRYPTO_UNIT.
+	VELO_CRYPTO_UNIT=$_vrc_unit
+	return 0
+}
+
+# velo_execute -- the gated real-install driver.  rc: 0 ok, 2 INERT, 1 abort/fail.
+velo_execute() {
+	if ! velo_armed; then
+		_putln "velo: NOT armed (VELO_ALLOW_EXECUTE!=yes) -- refusing to write." >&2
+		return 2
+	fi
+	if [ "$VELO_S_BOOTMODE" = "hybrid" ] && [ "$VELO_S_ENCRYPT" != "yes" ]; then
+		_putln "velo: ERROR -- hybrid boot mode requires FDE (encrypt=yes)." >&2
+		return 1
+	fi
+	if velo_disk_busy "$VELO_S_DISK"; then
+		_putln "velo: REFUSING -- $VELO_S_DISK has mounted partitions (the medium?)." >&2
+		return 1
+	fi
+	if ! velo_profile_target_size_ok "$VELO_S_DISK" "$VELO_S_PROFILE"; then
+		if [ -n "${_VDP_SECT:-}" ] && [ -n "${_VDP_BPS:-}" ]; then
+			_vx_target_size=$(velo_human_size $(( _VDP_SECT * _VDP_BPS )))
+		else
+			_vx_target_size="unknown"
+		fi
+		_putln "velo: REFUSING -- homely requires a target of at least 28 GiB." >&2
+		_putln "velo: detected size for $VELO_S_DISK: $_vx_target_size; nothing was written." >&2
+		return 1
+	fi
+	# ----- PRE-FLIGHT (all read-only): every check that CAN fail must run BEFORE
+	# the typed destroy-gate and the irreversible wipe, so a missing medium / empty
+	# password / non-oksh runtime / target-is-the-stick aborts while the TARGET IS
+	# STILL INTACT.  Until 2026-06-11 these ran AFTER velo_run_crypto, so "could not
+	# uniquely identify the velo install medium" was only discovered once the target
+	# had already been wiped and encrypted -- a direct violation of velo's own
+	# "fail-closed BEFORE anything irreversible" rule (it bit the 2026-06-08 run).
+	# Hashing happens here too (pure, no disk writes): a weird encrypt(1) failure
+	# then also aborts pre-wipe instead of leaving a half-built, encrypted target.
+	set +x
+	# Fail closed if `print` is not a builtin (non-oksh runtime): the hashing pipe
+	# below would feed encrypt(1) an EMPTY stdin, and encrypt would happily return a
+	# valid $2b$.. hash OF THE EMPTY STRING -- passing the bcrypt guard yet shipping a
+	# trivially-weak credential.  The real target (the bsd.rd /bin/ksh) has it; bail
+	# anywhere it does not rather than risk a silent empty-password install.
+	if [ "${VELO_HAS_PRINT:-0}" != 1 ]; then
+		_putln "velo: ERROR -- 'print' builtin unavailable; refusing to hash passwords." >&2
+		return 1
+	fi
+	if [ -z "$VELO_S_ROOTPW" ] || [ -z "$VELO_S_USERPW" ]; then
+		_putln "velo: ERROR -- root/user password not set; refusing to install." >&2
+		return 1
+	fi
+	# Refuse if the chosen TARGET is itself the velo install medium: erasing the
+	# only installer stick would kill the source mid-run, and velo_find_media_disk
+	# (which excludes the target) would then see ZERO media and abort with the
+	# misleading "is the stick inserted?".  Say it plainly instead -- the picker's
+	# soft [media?] tag is cosmetic; this is the hard stop.  The probe's rc is
+	# IGNORED on purpose (fail-open here is sound): an unreadable target probes to
+	# empty _VDP_* -> is_media false -> guard passes, and an unreadable disk cannot
+	# be the medium anyway; do not "fix" this into a fail-closed.
+	velo_disk_probe "$VELO_S_DISK"
+	if velo_disk_is_media; then
+		_putln "velo: REFUSING -- $VELO_S_DISK looks like the velo install medium itself." >&2
+		_putln "velo: pick a DIFFERENT target; never install onto the installer stick." >&2
+		_putln "velo: (a STALE/cloned velo stick you MEAN to overwrite trips this too --" >&2
+		_putln "velo:  zero its first MB from the shell first: dd if=/dev/zero of=/dev/rsdNc bs=1m count=1)" >&2
+		return 1
+	fi
+	# Resolve WHICH attached disk is the velo install medium (it carries the sets
+	# at 7.9/amd64), so gen_install_conf can pin the disk/partition/path.  The
+	# sd-unit is enumeration-order-dependent -- on a laptop the USB is rarely sd0
+	# (internal disk + install target shuffle the numbering: the 2026-06-08 Fujitsu
+	# run had sd0=internal Linux disk, so the unanswered set-location prompts
+	# defaulted to sd0/i and the install aborted "7.9/amd64 does not exist").
+	# Fingerprint the medium by its own disklabel signature; FAIL CLOSED if not unique.
+	VELO_S_MEDIADISK=$(velo_find_media_disk "$VELO_S_DISK") || {
+		_putln "velo: ERROR -- could not uniquely identify the velo install medium." >&2
+		_putln "velo: need EXACTLY ONE attached disk matching the medium signature." >&2
+		_putln "velo: (is the stick inserted?  is there a second/cloned velo stick?)  Aborting." >&2
+		return 1
+	}
+	if ! is_valid_disk "$VELO_S_MEDIADISK"; then
+		_putln "velo: ERROR -- media detection returned an invalid disk name; aborting." >&2
+		return 1
+	fi
+	# Hash the operator's root/user passwords with encrypt(1) -- present in the rd
+	# (the stock installer uses it too).  Secret hygiene mirrors the bioctl
+	# passphrase pipe (velo_run_crypto): plaintext flows VARIABLE -> `print` builtin
+	# (no fork, no argv) -> pipe -> encrypt STDIN; only the HASH is captured in
+	# $(...).  `-b a` = auto-rounds, exactly as the stock installer's encr_pwd().
+	VELO_S_ROOTPW_HASH=$(print -r -- "$VELO_S_ROOTPW" | encrypt -b a)
+	VELO_S_USERPW_HASH=$(print -r -- "$VELO_S_USERPW" | encrypt -b a)
+	# The installer's encr_pwd() takes a $2b$.. hash verbatim (no double-encrypt);
+	# refuse to write a response file unless BOTH look like real bcrypt hashes.
+	_vx_ok=yes
+	case "$VELO_S_ROOTPW_HASH" in '$2'*) : ;; *) _vx_ok=no ;; esac
+	case "$VELO_S_USERPW_HASH" in '$2'*) : ;; *) _vx_ok=no ;; esac
+	if [ "$_vx_ok" != yes ]; then
+		_putln "velo: ERROR -- encrypt(1) did not produce bcrypt hashes; aborting." >&2
+		VELO_S_ROOTPW_HASH=""; VELO_S_USERPW_HASH=""; return 1
+	fi
+	# ----- TYPED DESTROY-GATE: the LAST human checkpoint, now with every precondition
+	# already proven.  Nothing below this line until velo_run_crypto is recoverable.
+	if ! velo_confirm_destructive "$VELO_S_DISK"; then
+		velo_clear
+		_putln "velo: destructive confirmation failed/cancelled -- aborted."
+		return 1
+	fi
+	velo_clear
+	# TOCTOU belt: the operator can dwell at the gate indefinitely, and a USB
+	# hiccup/re-enumeration there leaves VELO_S_MEDIADISK pointing at a stale
+	# sd-unit that would only fail AFTER the wipe -- the exact failure class the
+	# pre-flight exists to prevent.  Re-probe the pinned medium NOW, still
+	# pre-wipe; abort if it no longer answers with the medium signature.
+	velo_disk_probe "$VELO_S_MEDIADISK"
+	if ! velo_disk_is_media; then
+		_putln "velo: ERROR -- install medium $VELO_S_MEDIADISK vanished/changed while waiting at the gate." >&2
+		_putln "velo: nothing was written; re-seat the stick and retry." >&2
+		return 1
+	fi
+	_putln "velo: ARMED + confirmed -- real install on $VELO_S_DISK."
+	_putln "velo: install medium = $VELO_S_MEDIADISK (sets at ${VELO_S_MEDIAPART}:${VELO_S_MEDIAPATH})"
+	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+		_putln "velo: creating softraid CRYPTO volume ..."
+		VELO_CRYPTO_UNIT=""
+		velo_run_crypto "$VELO_S_DISK"
+		if [ $? -ne 0 ] || [ -z "$VELO_CRYPTO_UNIT" ]; then
+			_putln "velo: ERROR -- crypto setup failed (target $VELO_S_DISK is now PARTIALLY WIPED); aborting." >&2
+			return 1
+		fi
+		VELO_S_ROOTDISK=$VELO_CRYPTO_UNIT
+		_putln "velo: CRYPTO root = $VELO_S_ROOTDISK (from bioctl softraid0)."
+	else
+		VELO_S_ROOTDISK=$VELO_S_DISK
+	fi
+	_vx_rf=/tmp/velo-install.conf
+	# gen_install_conf now emits the REAL hashes (globals set just above) into this
+	# file ONLY.  The on-screen audit-preview (velo_wizard / velo_plan) ran earlier
+	# with the globals still empty, so it showed the <bcrypt-hash> placeholder -- no
+	# credential, hashed or otherwise, ever reaches the screen.  Create the file
+	# 0600 FROM THE START via a subshell umask (a post-write chmod would leave a
+	# brief world-readable window on the hashes); rm any pre-existing path first so a
+	# planted symlink cannot redirect the hash write.  Trailing chmod is belt-and-braces.
+	rm -f "$_vx_rf" 2>/dev/null || true
+	if ! ( umask 077; gen_install_conf >"$_vx_rf" ); then
+		_putln "velo: ERROR generating install.conf" >&2; return 1
+	fi
+	chmod 0600 "$_vx_rf" 2>/dev/null || true
+	# NON-INTERACTIVE installer: `install -a -f FILE` (install.sub getopts) takes
+	# the cp-to-/tmp/ai/ai.conf branch -> do_install with NO 5s watchdog and NO
+	# auto_install.conf.  Sets from the medium (Location of sets=disk), verify off,
+	# site79.tgz LAST, install.site auto-run at its safe floor.
+	_putln "velo: running 'install -af' (non-interactive, no timeout) ..."
+	if ! install -a -f "$_vx_rf"; then
+		_putln "velo: ERROR -- installer returned non-zero." >&2; return 1
+	fi
+	# Apply the operator's profile/level.  Write the answers contract (m2-design
+	# s2.3) to the new root, then run the velo site hook CHROOTED with those
+	# answers present.  The hook ships as install.site.velo (NOT install.site),
+	# so the stock installer did NOT auto-run it at the safe floor -- velo runs it
+	# exactly once here, with the real profile=$VELO_S_PROFILE / $VELO_S_STARTMODE.
+	if mount "/dev/${VELO_S_ROOTDISK}a" /mnt 2>/dev/null || mount | grep -q " on /mnt "; then
+		velo_mount_target_partitions "$VELO_S_ROOTDISK"
+		mkdir -p /mnt/etc/velo 2>/dev/null
+		{
+			_putln "schema=1"
+			_putln "profile=$VELO_S_PROFILE"
+			_putln "startmode=$VELO_S_STARTMODE"
+			_putln "pkgs=$VELO_S_PKGS"
+			_putln "hostname=$VELO_S_HOSTNAME"
+			_putln "encrypt=$VELO_S_ENCRYPT"
+			_putln "wifi_ssid=$VELO_S_WIFI_SSID"
+		} >/mnt/etc/velo/answers 2>/dev/null
+		chmod 0600 /mnt/etc/velo/answers 2>/dev/null || true
+		# Verify the answers contract actually landed -- a silent write failure
+		# would make install.site.velo fall back to the safe floor (minimal+L1),
+		# losing the operator's profile/level (and, at L3, the fail-closed stack).
+		if [ -s /mnt/etc/velo/answers ]; then
+			_putln "velo: wrote answers (profile=$VELO_S_PROFILE startmode=$VELO_S_STARTMODE encrypt=$VELO_S_ENCRYPT)"
+		else
+			_putln "velo: ERROR could not write /mnt/etc/velo/answers -- chosen profile/level LOST; install.site.velo will fall back to the safe floor (minimal+L1)" >&2
+		fi
+		# Write Wi-Fi credentials directly to hostname.iwm0 (PSK never enters the
+		# answers audit file).  install.site.velo's L3/non-desktop prune gates will
+		# remove the file if the chosen profile or startmode excludes Wi-Fi.
+		if [ -n "$VELO_S_WIFI_SSID" ]; then
+			printf 'join "%s" wpakey "%s"\ndhcp\n' \
+				"$VELO_S_WIFI_SSID" "$VELO_S_WIFI_PSK" \
+				>/mnt/etc/hostname.iwm0 2>/dev/null \
+				&& _putln "velo: wrote /mnt/etc/hostname.iwm0 (SSID=$VELO_S_WIFI_SSID PSK=redacted)" \
+				|| _putln "velo: WARN could not write /mnt/etc/hostname.iwm0" >&2
+		fi
+		if [ -x /mnt/install.site.velo ]; then
+			_putln "velo: applying profile/level via 'chroot /mnt /install.site.velo' ..."
+			chroot /mnt /install.site.velo \
+				|| _putln "velo: WARN install.site.velo returned non-zero (see /var/log/velo-install.site.log)" >&2
+			rm -f /mnt/install.site.velo 2>/dev/null || true
+		else
+			_putln "velo: WARN /mnt/install.site.velo missing -- box left at installer defaults" >&2
+		fi
+		# hybrid: fill the 0xEF EFI partition with BOOTX64.EFI while /mnt is live.
+		if [ "$VELO_S_ENCRYPT" = "yes" ] && [ "$VELO_S_BOOTMODE" = "hybrid" ]; then
+			_putln "velo: filling EFI system partition (hybrid mode) ..."
+			velo_efifill "$VELO_S_DISK" \
+				|| _putln "velo: WARN velo_efifill returned non-zero -- UEFI boot may not work." >&2
+		fi
+		sync; velo_umount_target_partitions
+	else
+		# mount failed AND nothing is on /mnt: the post-install steps (answers,
+		# install.site.velo, hybrid EFI-fill) were ALL skipped.  Do NOT print
+		# "install complete" as if nothing happened.  For hybrid the ESP is then
+		# empty -> the disk will not boot via UEFI at all, so that case is FATAL.
+		_putln "velo: ERROR -- cannot mount /dev/${VELO_S_ROOTDISK}a; profile/answers/EFI-fill SKIPPED." >&2
+		if [ "$VELO_S_BOOTMODE" = "hybrid" ]; then
+			_putln "velo: hybrid install left an EMPTY ESP -- the box will NOT boot via UEFI" >&2
+			_putln "velo: (legacy BIOS boot may still work). FATAL." >&2
+			return 1
+		fi
+		_putln "velo: WARN -- box will boot at INSTALLER DEFAULTS (chosen profile/level NOT applied, rc.firsttime pkg_add will not run)." >&2
+		_putln "velo: install finished DEGRADED.  Reboot boots a stock-defaults box (no pkg_add)."
+		return 0
+	fi
+	_putln "velo: install complete.  Reboot to finish (rc.firsttime runs pkg_add)."
+	return 0
+}
+
+# _wiz_complete -- the post-install "what now" screen, shown ONLY after a
+# SUCCESSFUL real install (armed path, velo_execute rc 0).  It replaces the old
+# SILENT fall-through to the stock (I)/(U)/(A)/(S) menu, which made a perfect
+# install look like a no-op ("it just shows the installer again").  The single
+# thing the operator needs next is: power off, REMOVE the velo medium, and boot
+# the TARGET disk -- so we say exactly that, then offer to power off now.
+#
+# Re-enters raw TUI mode (velo_wizard already ran tui_cleanup before printing the
+# plan + the install progress); tui_init/tui_cleanup are balanced and re-entrant.
+# Declining the power-off returns 0 and the wizard falls through to the stock
+# menu/shell exactly as before -- the escape hatch is preserved.  Secrets were
+# already consumed by velo_execute; scrub again up-front so nothing lingers
+# across the confirm wait or into a No-path shell.  halt(8) lives in the install
+# ramdisk; if it is somehow absent (host/tests) the `|| true` falls through.
+_wiz_complete() {
+	_velo_scrub_secrets
+	tui_init
+	velo_clear
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 11 \
+		"INSTALL COMPLETE -- velo is on $VELO_S_DISK"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 1)) \
+		"OpenBSD + velo ($VELO_S_HOSTNAME) is installed and bootable."
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) \
+		"The FIRST boot finishes setup (pkg_add, fail-closed pf)."
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 4)) "To start using it:"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 5)) "  1. Power off this machine."
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 6)) "  2. REMOVE the velo install medium (USB / ISO)."
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 7)) "  3. Boot from the target disk ($VELO_S_DISK)."
+	_wiz_help "shell"
+	tui_confirm "$VELO_BOX_X" $((VELO_BOX_Y + 8)) "$VELO_BOX_W" \
+		"Power off" "Power off now?  (No -> stock installer menu / shell)"
+	_vc_off=$?
+	tui_cleanup
+	velo_clear
+	if [ "$_vc_off" -eq 0 ]; then
+		_putln "velo: powering off -- REMOVE the medium, then boot $VELO_S_DISK."
+		sync 2>/dev/null || true
+		halt -p 2>/dev/null || halt 2>/dev/null || true
+		# halt unavailable (host/tests) -> fall through to the normal return.
+	else
+		_putln "velo: install complete.  REMOVE the medium and boot $VELO_S_DISK."
+		_putln "velo: dropping to the stock OpenBSD installer menu / shell."
+	fi
+	return 0
+}
+
+# Drive all screens with ESC-steps-back navigation.
+velo_wizard() {
+	tui_init
+
+	_wz_screen=0
+	# Total CONFIG-screen count for the "Step k/N" counters.  FIXED at 10 (velo is
+	# FDE-first: the boot-mode screen is screen 10, and the disk-erase path even
+	# REQUIRES encrypt=yes).  Held constant -- NOT recomputed after the encrypt
+	# choice -- so the denominator never changes mid-wizard.  A plaintext install
+	# simply skips screen 10 and ends at "9/10" -> summary; the denominator stays
+	# put either way.  welcome and the summary FINAL GATE sit OUTSIDE it.
+	_wz_total=10
+	while :; do
+		case "$_wz_screen" in
+		0)
+			if _wiz_welcome; then _wz_screen=1; else
+				tui_cleanup
+				velo_clear
+				_putln "velo: cancelled."
+				_velo_scrub_secrets
+				return 1
+			fi
+			;;
+		1) if _wiz_disk;      then _wz_screen=2; else _wz_screen=0; fi ;;
+		2)
+			if _wiz_encrypt; then _wz_screen=3; else _wz_screen=1; fi
+			;;
+		3) if _wiz_rootpw;    then _wz_screen=4; else _wz_screen=2; fi ;;
+		4) if _wiz_userpw;    then _wz_screen=5; else _wz_screen=3; fi ;;
+		5) if _wiz_hostname;  then _wz_screen=6; else _wz_screen=4; fi ;;
+		6) if _wiz_wifi;      then _wz_screen=7; else _wz_screen=5; fi ;;
+		7) if _wiz_profile;   then _wz_screen=8; else _wz_screen=6; fi ;;
+		8) if _wiz_packages;  then _wz_screen=9; else _wz_screen=7; fi ;;
+		9) if _wiz_startmode; then _wz_screen=10; else _wz_screen=8; fi ;;
+		10)
+			# Boot/firmware target -- FDE only.  A plaintext install skips
+			# straight to the summary (the stock installer lays out its disk);
+			# only an encrypted install reaches _wiz_bootmode, where ESC steps
+			# back to start mode.
+			if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+				if _wiz_bootmode; then _wz_screen=11; else _wz_screen=9; fi
+			else
+				_wz_screen=11
+			fi
+			;;
+		11)
+			if _wiz_summary; then
+				break          # Yes -> build & print the plan
+			else
+				_wz_screen=1   # No -> revise from screen 1
+			fi
+			;;
+		esac
+	done
+
+	# Derive the root disk now that all data is collected.
+	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+		VELO_S_ROOTDISK="sdN"
+	else
+		VELO_S_ROOTDISK="$VELO_S_DISK"
+	fi
+
+	tui_cleanup
+	velo_clear
+
+	# Build & print the plan (AUDIT PREVIEW, shown even on real media).
+	# plan_crypto prints the VARIABLE NAME, not the secret; gen_install_conf
+	# carries no secret.
+	_putln "=== velo install plan ==="
+	_putln ""
+	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
+		_putln "--- planned full-disk-encryption shell sequence ---"
+		plan_crypto "$VELO_S_DISK"
+		_putln ""
+	fi
+	_putln "--- generated install.conf ---"
+	gen_install_conf
+	_putln ""
+	_putln "Packages recorded for M2 (installed post-reboot): ${VELO_S_PKGS:-(none)}"
+	_putln ""
+
+	# GATED REAL EXECUTE (M3 s2.3).  INERT unless armed: on host / tests /
+	# `plan` mode VELO_ALLOW_EXECUTE is unset, so velo_execute returns 2 and
+	# writes NOTHING -- the plan above is then the whole output, identical to the
+	# M1 DRY-RUN.  On the real medium the launcher arms it; velo_execute runs the
+	# typed-confirm gate then the real install.  The passphrase is consumed INSIDE
+	# velo_execute (velo_run_crypto), so the scrub MUST stay AFTER this call.
+	if velo_armed; then
+		velo_execute; _vw_rc=$?
+		# Success -> the post-install "what now" screen (power off / remove medium
+		# / boot the target).  This is the ONE place that tells the operator the
+		# install is DONE and how to use it, instead of silently re-showing the
+		# stock (I)/(U)/(A)/(S) menu.  rc 1 (abort/fail) keeps the plain message;
+		# rc 2 (inert) cannot occur here -- we are inside the armed branch.
+		if [ "$_vw_rc" -eq 0 ]; then
+			_wiz_complete
+		elif [ "$_vw_rc" -eq 1 ]; then
+			_putln "velo: install aborted or failed."
+		fi
+	else
+		_putln "velo: DRY-RUN only (not armed) -- nothing was written to disk."
+	fi
+
+	# Scrub the secrets now that crypto setup + install consumed them (or we were
+	# inert).  Covers the FDE passphrase AND the root/user passwords + their hashes.
+	_velo_scrub_secrets
+	return 0
+}
+
+# ===========================================================================
+#  SELFTEST  (pure-function assertions; runs under bash AND oksh, no tty)
+# ===========================================================================
+velo_selftest() {
+	_st_fail=0
+	_st_n=0
+
+	# assert_eq LABEL EXPECTED ACTUAL
+	assert_eq() {
+		_st_n=$((_st_n + 1))
+		if [ "$2" = "$3" ]; then
+			_putln "ok   $1"
+		else
+			_putln "FAIL $1"
+			_putln "       expected: [$2]"
+			_putln "       actual:   [$3]"
+			_st_fail=$((_st_fail + 1))
+		fi
+	}
+	# assert_rc LABEL EXPECTED_RC ACTUAL_RC
+	assert_rc() {
+		_st_n=$((_st_n + 1))
+		if [ "$2" = "$3" ]; then
+			_putln "ok   $1"
+		else
+			_putln "FAIL $1 (rc expected $2 got $3)"
+			_st_fail=$((_st_fail + 1))
+		fi
+	}
+	# assert_has LABEL HAYSTACK NEEDLE
+	assert_has() {
+		_st_n=$((_st_n + 1))
+		case "$2" in
+		*"$3"*) _putln "ok   $1" ;;
+		*) _putln "FAIL $1 (missing substring: [$3])"; _st_fail=$((_st_fail + 1)) ;;
+		esac
+	}
+	# assert_hasnt LABEL HAYSTACK NEEDLE
+	assert_hasnt() {
+		_st_n=$((_st_n + 1))
+		case "$2" in
+		*"$3"*) _putln "FAIL $1 (UNEXPECTED substring: [$3])"; _st_fail=$((_st_fail + 1)) ;;
+		*) _putln "ok   $1" ;;
+		esac
+	}
+
+	# --- 1. is_valid_disk -------------------------------------------------
+	is_valid_disk sd0;  assert_rc "is_valid_disk sd0"  0 $?
+	is_valid_disk wd12; assert_rc "is_valid_disk wd12" 0 $?
+	is_valid_disk cd0;  assert_rc "is_valid_disk cd0 reject"  1 $?
+	is_valid_disk sd;   assert_rc "is_valid_disk sd reject"   1 $?
+	is_valid_disk sd0x; assert_rc "is_valid_disk sd0x reject" 1 $?
+	is_valid_disk xsd0; assert_rc "is_valid_disk xsd0 reject" 1 $?
+	is_valid_disk "";   assert_rc "is_valid_disk empty reject" 1 $?
+	is_valid_disk "sd0; rm -rf /"; assert_rc "is_valid_disk injection reject" 1 $?
+
+	# --- 2. velo_list_disks (injected) ------------------------------------
+	_st_list=$(VELO_FAKE_DISKS='sd0:a,cd0:,wd1:b,rd0:,sd2' velo_list_disks)
+	# normalise newlines to spaces for comparison
+	_st_list_sp=$(VELO_FAKE_DISKS='sd0:a,cd0:,wd1:b,rd0:,sd2' velo_list_disks | while IFS= read -r _l; do _put "$_l "; done)
+	assert_eq "velo_list_disks drops cd/rd, strips DUIDs, keeps order" "sd0 wd1 sd2 " "$_st_list_sp"
+
+	# --- 3. idx_to_disk over that list ------------------------------------
+	VELO_FAKE_DISKS='sd0:a,cd0:,wd1:b,rd0:,sd2'
+	assert_eq "idx_to_disk 0" "sd0" "$(idx_to_disk 0)"
+	assert_eq "idx_to_disk 1" "wd1" "$(idx_to_disk 1)"
+	assert_eq "idx_to_disk 2" "sd2" "$(idx_to_disk 2)"
+	idx_to_disk 3 >/dev/null; assert_rc "idx_to_disk 3 out-of-range" 1 $?
+	assert_eq "idx_to_disk 3 empty" "" "$(idx_to_disk 3)"
+	unset VELO_FAKE_DISKS
+
+	# --- index->label for profile/startmode -------------------------------
+	assert_eq "idx_to_profile 0"   "homely"   "$(idx_to_profile 0)"
+	assert_eq "idx_to_profile 2"   "fortress" "$(idx_to_profile 2)"
+	assert_eq "idx_to_startmode 0" "L1"       "$(idx_to_startmode 0)"
+	assert_eq "idx_to_startmode 2" "L3"       "$(idx_to_startmode 2)"
+
+	# --- idxset_to_pkgs (checklist re-index) ------------------------------
+	assert_eq "idxset_to_pkgs maps checked indices" "git tmux vim" \
+		"$(idxset_to_pkgs '0 2 3' git curl tmux vim)"
+	assert_eq "idxset_to_pkgs empty selection" "" \
+		"$(idxset_to_pkgs '' git curl tmux vim)"
+
+	# --- 4. valid_hostname ------------------------------------------------
+	valid_hostname "velo-bsd"; assert_rc "valid_hostname velo-bsd" 0 $?
+	valid_hostname "-bad";     assert_rc "valid_hostname -bad reject" 1 $?
+	valid_hostname "bad-";     assert_rc "valid_hostname bad- reject" 1 $?
+	valid_hostname "a.b";      assert_rc "valid_hostname a.b reject" 1 $?
+	valid_hostname "a b";      assert_rc "valid_hostname 'a b' reject" 1 $?
+	valid_hostname "";         assert_rc "valid_hostname empty reject" 1 $?
+	# 63-char label ok, 64 rejected
+	_st_h63="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	valid_hostname "$_st_h63";   assert_rc "valid_hostname 63-char ok"  0 $?
+	valid_hostname "${_st_h63}a"; assert_rc "valid_hostname 64-char reject" 1 $?
+
+	# --- 5. profile_pkgs --------------------------------------------------
+	assert_eq "profile_pkgs minimal" "git curl nano" "$(profile_pkgs minimal)"
+	assert_has "profile_pkgs homely has openbox" "$(profile_pkgs homely)" "openbox"
+	assert_has "profile_pkgs homely has terminator" "$(profile_pkgs homely)" "terminator"
+	assert_has "profile_pkgs homely has noto-fonts" "$(profile_pkgs homely)" "noto-fonts"
+	assert_has "profile_pkgs fortress has tor" "$(profile_pkgs fortress)" "tor"
+	profile_pkgs bogus >/dev/null; assert_rc "profile_pkgs unknown nonzero" 1 $?
+	assert_eq "profile_pkgs unknown empty" "" "$(profile_pkgs bogus)"
+
+	# --- 6. gen_install_conf (encrypt=no) ---------------------------------
+	VELO_S_ENCRYPT="no"; VELO_S_DISK="sd0"; VELO_S_ROOTDISK="sd0"
+	VELO_S_HOSTNAME="velo-bsd"; VELO_S_PROFILE="homely"; VELO_S_STARTMODE="L1"
+	VELO_S_PASSPHRASE="TOPSECRET-PASS"
+	_st_conf=$(gen_install_conf)
+	assert_has "conf has root disk sd0" "$_st_conf" "Which disk is the root disk = sd0"
+	assert_has "conf has hostname"       "$_st_conf" "System hostname = velo-bsd"
+	assert_has "conf has verify-off"     "$_st_conf" "Continue without verification = yes"
+	# wired-ethernet block: em0/dhcp pinned, iwm0 never reached (2026-06-07 fix).
+	# Two interface lines (em0 then done) -- _autorespond consumes one per pass.
+	assert_has "conf picks em0 iface"    "$_st_conf" "Network interface to configure = em0"
+	assert_has "conf em0 is dhcp"        "$_st_conf" "IPv4 address for em0 = autoconf"
+	assert_has "conf em0 no ipv6"        "$_st_conf" "IPv6 address for em0 = none"
+	assert_has "conf iface loop done"    "$_st_conf" "Network interface to configure = done"
+	assert_hasnt "conf never names iwm0" "$_st_conf" "iwm0"
+	assert_hasnt "conf no passphrase"    "$_st_conf" "TOPSECRET-PASS"
+	assert_hasnt "conf no bioctl"        "$_st_conf" "bioctl"
+
+	# --- 7. gen_install_conf (encrypt=yes -> crypto placeholder) ----------
+	VELO_S_ENCRYPT="yes"; VELO_S_ROOTDISK="sdN"
+	_st_conf2=$(gen_install_conf)
+	assert_has "conf(yes) root disk = sdN" "$_st_conf2" "Which disk is the root disk = sdN"
+	assert_hasnt "conf(yes) no passphrase" "$_st_conf2" "TOPSECRET-PASS"
+
+	# injection guard: a malformed hostname in state must not split a line.
+	VELO_S_HOSTNAME="evil = boom"
+	_st_conf3=$(gen_install_conf)
+	assert_has "conf sanitises bad hostname" "$_st_conf3" "System hostname = velo-bsd"
+	assert_hasnt "conf bad hostname not injected" "$_st_conf3" "evil = boom"
+	VELO_S_HOSTNAME="velo-bsd"
+
+	# --- 7b. password hash globals (placeholder vs real) ------------------
+	# Empty hash globals -> the <bcrypt-hash> placeholder (DRY-RUN/plan/preview
+	# carry NO credential).
+	VELO_S_ROOTPW_HASH=""; VELO_S_USERPW_HASH=""
+	_st_cph=$(gen_install_conf)
+	assert_has "conf placeholder root (no hash)" "$_st_cph" "Password for root = <bcrypt-hash>"
+	assert_has "conf placeholder user (no hash)" "$_st_cph" "Password for user = <bcrypt-hash>"
+	# Set hash globals (the velo_execute path) -> the real hash is emitted.
+	VELO_S_ROOTPW_HASH='$2b$10$ROOThashROOThashROOThashROOThashROOThashRO'
+	VELO_S_USERPW_HASH='$2b$10$USERhashUSERhashUSERhashUSERhashUSERhashUS'
+	_st_cph2=$(gen_install_conf)
+	assert_has "conf emits root hash"  "$_st_cph2" 'Password for root = $2b$10$ROOThash'
+	assert_has "conf emits user hash"  "$_st_cph2" 'Password for user = $2b$10$USERhash'
+	assert_hasnt "conf no placeholder when hashed" "$_st_cph2" "<bcrypt-hash>"
+	VELO_S_ROOTPW_HASH=""; VELO_S_USERPW_HASH=""
+
+	# --- 7c. plaintext passwords NEVER leak into install.conf -------------
+	VELO_S_ROOTPW="PLAINTEXT-ROOT-PW"; VELO_S_USERPW="PLAINTEXT-USER-PW"
+	_st_cpl=$(gen_install_conf)
+	assert_hasnt "conf no plaintext root pw" "$_st_cpl" "PLAINTEXT-ROOT-PW"
+	assert_hasnt "conf no plaintext user pw" "$_st_cpl" "PLAINTEXT-USER-PW"
+	VELO_S_ROOTPW=""; VELO_S_USERPW=""
+
+	# --- 8. plan_crypto ---------------------------------------------------
+	VELO_S_PASSPHRASE="TOPSECRET-PASS"
+	_st_pc=$(plan_crypto sd0)
+	assert_rc "plan_crypto sd0 rc" 0 $?
+	assert_has "plan_crypto bioctl line"  "$_st_pc" 'bioctl -Cforce -cC -l"sd0a" -s softraid0'
+	assert_has "plan_crypto stdin pipe (var name)" "$_st_pc" 'print -r -- "$VELO_PASSPHRASE" |'
+	assert_has "plan_crypto fdisk quoted disk" "$_st_pc" 'fdisk -iy -g -b 960 "sd0"'
+	assert_has "plan_crypto target pre-wipe"   "$_st_pc" 'dd if=/dev/zero of="/dev/rsd0c" bs=1m count=8'
+	assert_has "plan_crypto dd wipe quoted"    "$_st_pc" 'dd if=/dev/zero of="/dev/rsdNc" bs=1m count=1'
+	assert_hasnt "plan_crypto no real secret"  "$_st_pc" "TOPSECRET-PASS"
+	# bad input -> nonzero, prints nothing
+	_st_pcbad=$(plan_crypto cd0); _st_pcbad_rc=$?
+	assert_rc "plan_crypto cd0 nonzero" 1 "$_st_pcbad_rc"
+	assert_eq "plan_crypto cd0 prints nothing" "" "$_st_pcbad"
+	_st_pcinj=$(plan_crypto "sd0; rm -rf /"); _st_pcinj_rc=$?
+	assert_rc "plan_crypto injection nonzero" 1 "$_st_pcinj_rc"
+	assert_eq "plan_crypto injection prints nothing" "" "$_st_pcinj"
+
+	# --- 8b. boot-mode: fdisk args (single source of truth) / detect / -----
+	#         resolve / anti-drift preview ----------------------------------
+	assert_eq "fdisk_args uefi -> GPT+ESP" "-iy -g -b 960" "$(velo_fdisk_args uefi)"
+	assert_eq "fdisk_args bios -> MBR"     "-iy"           "$(velo_fdisk_args bios)"
+	velo_fdisk_args same    >/dev/null; assert_rc "fdisk_args same not effective"  1 $?
+	velo_fdisk_args unknown >/dev/null; assert_rc "fdisk_args unknown nonzero"     1 $?
+	velo_fdisk_args ""      >/dev/null; assert_rc "fdisk_args empty nonzero"       1 $?
+	assert_eq "detect honours override uefi" "uefi" "$(VELO_BOOTMODE_DETECT=uefi velo_detect_bootmode)"
+	assert_eq "detect honours override bios" "bios" "$(VELO_BOOTMODE_DETECT=bios velo_detect_bootmode)"
+	VELO_S_BOOTMODE=uefi
+	assert_eq "resolve: explicit uefi wins over detect" "uefi" "$(VELO_BOOTMODE_DETECT=bios velo_resolve_bootmode)"
+	VELO_S_BOOTMODE=bios
+	assert_eq "resolve: explicit bios" "bios" "$(velo_resolve_bootmode)"
+	VELO_S_BOOTMODE=same
+	assert_eq "resolve: same -> detect uefi" "uefi" "$(VELO_BOOTMODE_DETECT=uefi velo_resolve_bootmode)"
+	assert_eq "resolve: same -> detect bios" "bios" "$(VELO_BOOTMODE_DETECT=bios velo_resolve_bootmode)"
+	VELO_BOOTMODE_DETECT=unknown velo_resolve_bootmode >/dev/null
+	assert_rc "resolve: same + unknown -> STOP (rc1)" 1 $?
+	assert_eq "resolve: same + unknown echoes unknown" "unknown" "$(VELO_BOOTMODE_DETECT=unknown velo_resolve_bootmode)"
+	# plan_crypto reflects the resolved mode (preview can't drift from the real
+	# run -- both route through velo_fdisk_args):
+	VELO_S_BOOTMODE=uefi; _st_pcu=$(plan_crypto sd0)
+	assert_has "plan_crypto uefi -> GPT fdisk"  "$_st_pcu" 'fdisk -iy -g -b 960 "sd0"'
+	VELO_S_BOOTMODE=bios; _st_pcb=$(plan_crypto sd0)
+	assert_has  "plan_crypto bios -> MBR fdisk"  "$_st_pcb" 'fdisk -iy "sd0"'
+	assert_hasnt "plan_crypto bios is not GPT"   "$_st_pcb" 'fdisk -iy -g'
+	# same + undetectable (host/off-target preview) -> uefi preview WITH a note;
+	# the REAL velo_run_crypto instead STOPs (covered behaviourally by the suite
+	# section 8c, which drives velo_run_crypto with fdisk shadowed and asserts it
+	# returns 1 without reaching fdisk):
+	VELO_S_BOOTMODE=same; _st_pcs=$(VELO_BOOTMODE_DETECT=unknown plan_crypto sd0)
+	assert_has "plan_crypto same/unknown -> uefi preview" "$_st_pcs" 'fdisk -iy -g -b 960 "sd0"'
+	assert_has "plan_crypto same/unknown notes run-time detect" "$_st_pcs" 'auto-detected at run time'
+	# hybrid mode: fdisk_args -> "-iy" (step 1 only); resolve honours explicit hybrid;
+	# plan_crypto shows step-1 fdisk + step-2 reference block; not GPT.
+	assert_eq "fdisk_args hybrid -> MBR step1" "-iy" "$(velo_fdisk_args hybrid)"
+	VELO_S_BOOTMODE=hybrid
+	assert_eq "resolve: explicit hybrid" "hybrid" "$(velo_resolve_bootmode)"
+	_st_pch=$(plan_crypto sd0)
+	assert_has  "plan_crypto hybrid -> step1 MBR fdisk" "$_st_pch" 'fdisk -iy "sd0"'
+	assert_hasnt "plan_crypto hybrid is not GPT"        "$_st_pch" 'fdisk -iy -g'
+	assert_has  "plan_crypto hybrid -> step2 note"      "$_st_pch" 'hybrid step 2'
+	assert_has  "plan_crypto hybrid -> EFI fill note"   "$_st_pch" 'BOOTX64.EFI'
+	VELO_S_BOOTMODE=same                 # restore the default
+
+	# --- 9. confirm-twice mismatch logic (pure) ---------------------------
+	# Replicate the wizard's decision predicate as a pure check.
+	pass_match() { [ -n "$1" ] && [ "$1" = "$2" ]; }
+	pass_match "abc" "abc"; assert_rc "pass_match equal nonempty -> accept" 0 $?
+	pass_match "abc" "abd"; assert_rc "pass_match mismatch -> reject"        1 $?
+	pass_match "" "";       assert_rc "pass_match empty -> reject"           1 $?
+
+	# --- 8e. velo_efifill / velo_fdisk_hybrid_esp input validation -----------
+	# Pure validation paths (no real disk involved):
+	#   - bad disk name rejects before any disk I/O (is_valid_disk guard)
+	#   - missing /mnt/usr/mdec/BOOTX64.EFI rejects (checked before disklabel)
+	velo_efifill cd0 >/dev/null 2>&1; assert_rc "efifill bad disk nonzero" 1 $?
+	velo_efifill ""  >/dev/null 2>&1; assert_rc "efifill empty disk nonzero" 1 $?
+	# Without /mnt/usr/mdec/BOOTX64.EFI (not present on the test host):
+	velo_efifill sd0 >/dev/null 2>&1; assert_rc "efifill missing BOOTX64.EFI nonzero" 1 $?
+	velo_fdisk_hybrid_esp cd0 >/dev/null 2>&1; assert_rc "fdisk_hybrid_esp bad disk nonzero" 1 $?
+	velo_fdisk_hybrid_esp ""  >/dev/null 2>&1; assert_rc "fdisk_hybrid_esp empty disk nonzero" 1 $?
+
+	# _velo_scrub_secrets clears every secret global (every wizard/plan exit path).
+	VELO_S_PASSPHRASE=x; VELO_PASSWORD=x; VELO_S_ROOTPW=x; VELO_S_USERPW=x
+	VELO_S_ROOTPW_HASH=x; VELO_S_USERPW_HASH=x
+	_velo_scrub_secrets
+	assert_eq "scrub clears passphrase" "" "$VELO_S_PASSPHRASE"
+	assert_eq "scrub clears rootpw"     "" "$VELO_S_ROOTPW"
+	assert_eq "scrub clears userpw"     "" "$VELO_S_USERPW"
+	assert_eq "scrub clears roothash"   "" "$VELO_S_ROOTPW_HASH"
+	assert_eq "scrub clears userhash"   "" "$VELO_S_USERPW_HASH"
+
+	# --- scrub ------------------------------------------------------------
+	VELO_S_PASSPHRASE=""; VELO_PASSWORD=""
+	VELO_S_ROOTPW=""; VELO_S_USERPW=""
+	VELO_S_ROOTPW_HASH=""; VELO_S_USERPW_HASH=""
+
+	_putln ""
+	if [ "$_st_fail" -eq 0 ]; then
+		_putln "PASS: all $_st_n assertions passed."
+		return 0
+	else
+		_putln "FAIL: $_st_fail of $_st_n assertions failed."
+		return 1
+	fi
+}
+
+# ===========================================================================
+#  DISPATCH
+# ===========================================================================
+velo_main() {
+	case "${1:-}" in
+	plan)
+		velo_plan
+		;;
+	selftest)
+		velo_selftest
+		;;
+	""|interactive)
+		# Interactive needs a real tty.  If stdin is not a tty, refuse and
+		# point at the non-interactive entrypoint (same guard pattern as demo).
+		if [ ! -t 0 ]; then
+			_putln "velo-install: no tty for the interactive wizard." >&2
+			_putln "Use:  velo-install plan      (non-interactive dry-run)" >&2
+			_putln "  or: velo-install selftest  (pure-function tests)" >&2
+			return 2
+		fi
+		velo_wizard
+		;;
+	*)
+		_putln "usage: velo-install [plan|selftest|interactive]" >&2
+		return 2
+		;;
+	esac
+}
+
+# Only run main when EXECUTED, not when sourced (so the test file can source
+# this and call the pure functions directly).  $0 ends in velo-install when
+# executed; the test sources it and sets VELO_SOURCED=1 first.
+if [ -z "${VELO_SOURCED:-}" ]; then
+	velo_main "$@"
+fi

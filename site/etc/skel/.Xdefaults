@@ -1,0 +1,16 @@
+! velo homely -- X resources (xterm fallback + xrdb merge at login)
+Xft.antialias: 1
+Xft.hinting:   1
+Xft.hintstyle: hintslight
+Xft.rgba:      rgb
+Xft.lcdfilter: lcddefault
+Xft.dpi:       96
+XTerm*faceName:     DejaVu Sans Mono
+XTerm*faceSize:     11
+XTerm*utf8:         2
+XTerm*locale:       true
+XTerm*background:   #1d2021
+XTerm*foreground:   #ebdbb2
+XTerm*saveLines:    8192
+XTerm*scrollBar:    false
+XTerm*metaSendsEscape: true
