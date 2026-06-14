@@ -59,9 +59,9 @@
 UEFI — velo поддерживает оба, мастер сам определит прошивку). Появляется ASCII-TUI velo.
 
 ### Шаг 4 — Установка на железо ⛔ HARD STOP (supervised)
-Мастер (≈9 экранов при FDE): диск → шифрование → пароль(и) → hostname → **профиль = homely** →
-пакеты → Protection level (L1 baseline / L2 / L3 Tor-only) → boot-mode (bios/uefi/hybrid) →
-summary → **DESTROY-гейт** (впечатать имя диска).
+Мастер (10 экранов при FDE, «Step k/10»): диск → шифрование → root-пароль → user-пароль →
+hostname → Wi-Fi → **профиль = homely** → пакеты → Protection level (L1/L2/L3) →
+boot-mode (bios/uefi/hybrid) → summary → **DESTROY-гейт** (впечатать имя диска).
 - **Целевой диск установки — ОТДЕЛЬНЫЙ** (рекоменд. внешний SSD), **не сам USB и не `nvme`**.
   Мастер до деструктива покажет идентичность диска (размер/DUID); **homely требует ≥ 28 GiB**.
 - Установка оффлайн; на первой загрузке `pkg_add` ставит homely-стол из встроенного closure,

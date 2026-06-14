@@ -128,9 +128,9 @@ VELO_I_AM_SURE=yes build/write-usb.sh dist/velo79.img sd2
 
 1. Воткни USB в целевой ноут, в BIOS/boot-menu выбери загрузку с USB (legacy/SeaBIOS или
    UEFI — velo поддерживает оба; мастер сам определит прошивку).
-2. Появится **ASCII-TUI velo** (синий бокс). Мастер (9 экранов при FDE):
-   диск → шифрование → пароль(и) → hostname → **профиль = homely** → пакеты →
-   **Protection level** (L1 baseline / L2 / L3 Tor-only) → boot-mode → summary →
+2. Появится **ASCII-TUI velo** (синий бокс). Мастер (10 экранов при FDE, «Step k/10»):
+   диск → шифрование → root-пароль → user-пароль → hostname → Wi-Fi → **профиль = homely** →
+   пакеты → **Protection level** (L1/L2/L3) → boot-mode → summary →
    DESTROY-гейт (впечатать имя диска).
 3. **Целевой диск установки** выбирай ОТДЕЛЬНЫЙ (рекоменд. — внешний SSD), **не сам USB**
    и **не системный nvme**. Мастер до деструктива покажет идентичность диска (размер/DUID).
