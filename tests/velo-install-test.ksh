@@ -575,17 +575,6 @@ t_eq "scrub clears userpw"     "" "$VELO_S_USERPW"
 t_eq "scrub clears roothash"   "" "$VELO_S_ROOTPW_HASH"
 t_eq "scrub clears userhash"   "" "$VELO_S_USERPW_HASH"
 
-# _velo_scrub_secrets must clear EVERY secret global (used on every wizard/plan exit)
-VELO_S_PASSPHRASE=x; VELO_PASSWORD=x; VELO_S_ROOTPW=x; VELO_S_USERPW=x
-VELO_S_ROOTPW_HASH=x; VELO_S_USERPW_HASH=x
-_velo_scrub_secrets
-t_eq "scrub clears passphrase" "" "$VELO_S_PASSPHRASE"
-t_eq "scrub clears VELO_PASSWORD" "" "$VELO_PASSWORD"
-t_eq "scrub clears rootpw"     "" "$VELO_S_ROOTPW"
-t_eq "scrub clears userpw"     "" "$VELO_S_USERPW"
-t_eq "scrub clears roothash"   "" "$VELO_S_ROOTPW_HASH"
-t_eq "scrub clears userhash"   "" "$VELO_S_USERPW_HASH"
-
 # ===========================================================================
 # 10. DRY-RUN invariant: the full `plan` output is TEXT ONLY, no secret leak,
 #     and contains no EXECUTED destructive call (the destructive tokens appear

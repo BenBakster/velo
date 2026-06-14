@@ -291,10 +291,6 @@ v_nofile "DRY fortress/L3: Xsetup_0 pruned (!homely)" "$R2/etc/X11/xenodm/Xsetup
 # the chosen pf ruleset at end of boot (guards the intermittent early-boot load gap).
 RL2=$(cat "$R2/etc/rc.local" 2>/dev/null)
 v_has   "DRY fortress/L3: rc.local re-asserts pf at boot" "$RL2" "pfctl -f /etc/pf.conf"
-# Boot-time fail-closed invariant: install.site must seed /etc/rc.local to re-assert
-# the chosen pf ruleset at end of boot (guards the intermittent early-boot load gap).
-RL2=$(cat "$R2/etc/rc.local" 2>/dev/null)
-v_has   "DRY fortress/L3: rc.local re-asserts pf at boot" "$RL2" "pfctl -f /etc/pf.conf"
 
 # --- D: SAFE FLOOR -- missing answers file -> minimal + L1 ------------------
 R3="$TMPBASE/r3"
@@ -449,19 +445,6 @@ TORRC=$(cat "$SITE/etc/tor/torrc")
 TORRC_RULES=$(grep -vE '^[[:space:]]*#' "$SITE/etc/tor/torrc")
 v_has   "L3 torrc enables SOCKSPort 9050"  "$TORRC_RULES" "SOCKSPort 127.0.0.1:9050"
 v_hasnt "L3 torrc has NO TransPort (SOCKS-only)" "$TORRC_RULES" "TransPort"
-# CRITICAL: tor must run as _tor or the fail-closed pf (pass out user _tor) drops
-# its egress and the box bricks.  velo's torrc MUST carry `User _tor` (the rc
-# framework otherwise starts tor as root -> not covered by the _tor pass rule).
-v_has   "L3 torrc runs tor as _tor (User _tor)" "$TORRC_RULES" "User _tor"
-# tor started by rc as root defaults DataDirectory to /root/.tor, which _tor
-# cannot access after the User drop -> tor exits.  Must pin it to the package's
-# _tor-owned /var/tor.
-v_has   "L3 torrc pins DataDirectory to /var/tor" "$TORRC_RULES" "DataDirectory /var/tor"
-# SOCKS must stay loopback-bound (never 0.0.0.0) -- a LAN-exposure regression guard.
-v_hasnt "L3 torrc: SOCKS NOT on 0.0.0.0"        "$TORRC_RULES" "0.0.0.0:9050"
-# best-anonymity hardening present (forces Tor-side DNS; pure client).
-v_has   "L3 torrc: SafeSocks on (no DNS-leak)"  "$TORRC_RULES" "SafeSocks 1"
-v_has   "L3 torrc: ClientOnly (never a relay)"  "$TORRC_RULES" "ClientOnly 1"
 # CRITICAL: tor must run as _tor or the fail-closed pf (pass out user _tor) drops
 # its egress and the box bricks.  velo's torrc MUST carry `User _tor` (the rc
 # framework otherwise starts tor as root -> not covered by the _tor pass rule).
