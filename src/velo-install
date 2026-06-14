@@ -1076,6 +1076,26 @@ _wiz_hostname() {
 	done
 }
 
+# valid_wifi_value VALUE -- a Wi-Fi SSID or WPA key safe to splice into BOTH the
+# single-line `join "..." wpakey "..."` hostname.iwm0 directive AND the key=value
+# answers file: non-empty, no double-quote / backslash (would break the quoted
+# directive), and no embedded newline (would split the line and inject a second
+# ifconfig directive / answers key).  Mirrors is_valid_disk / valid_hostname so a
+# hostile or env-pre-seeded value cannot escape its field.
+valid_wifi_value() {
+	_vwv=$1
+	[ -n "$_vwv" ] || return 1
+	case "$_vwv" in
+	*'"'*|*'\'*) return 1 ;;
+	esac
+	# A literal newline in the pattern catches a value carrying an embedded LF.
+	case "$_vwv" in
+	*'
+'*) return 1 ;;
+	esac
+	return 0
+}
+
 # Returns 0 on confirm/skip, 1 on ESC/back.  Optional screen: blank SSID skips
 # Wi-Fi setup entirely (the template hostname.iwm0 ships without credentials).
 # When SSID is provided, PSK is required; both are written directly to
@@ -1092,18 +1112,22 @@ _wiz_wifi() {
 		if [ -z "$_ww_ssid" ]; then
 			VELO_S_WIFI_SSID=""; VELO_S_WIFI_PSK=""; _ww_ssid=""; return 0
 		fi
-		case "$_ww_ssid" in
-		*'"'*|*"\\"*)
+		if ! valid_wifi_value "$_ww_ssid"; then
 			tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Invalid SSID" \
-				"No double-quotes or backslashes in SSID."
-			_ww_ssid=""; continue ;;
-		esac
+				"No double-quotes, backslashes or newlines in SSID."
+			_ww_ssid=""; continue
+		fi
 		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) $((VELO_BOX_W - 4)) \
 			"WPA key:            " || return 1
 		_ww_psk=$VELO_PASSWORD; VELO_PASSWORD=""
 		if [ -z "$_ww_psk" ]; then
 			tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Required" \
 				"WPA key cannot be empty."
+			_ww_ssid=""; _ww_psk=""; continue
+		fi
+		if ! valid_wifi_value "$_ww_psk"; then
+			tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 5)) "$VELO_BOX_W" "Invalid key" \
+				"No double-quotes, backslashes or newlines in WPA key."
 			_ww_ssid=""; _ww_psk=""; continue
 		fi
 		VELO_S_WIFI_SSID=$_ww_ssid; VELO_S_WIFI_PSK=$_ww_psk

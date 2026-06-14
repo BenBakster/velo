@@ -147,6 +147,24 @@ valid_hostname "$_H63";    t_rc "hostname 63 chars accept" 0 $?
 valid_hostname "${_H63}a"; t_rc "hostname 64 chars reject" 1 $?
 
 # ===========================================================================
+#  4b. valid_wifi_value accept / reject.  Closes the answers/hostname.iwm0
+#      line-injection gap: a newline in the SSID or WPA key would split the
+#      key=value answers line (inject a second directive) or add a second
+#      ifconfig line to hostname.iwm0.  '"' and '\' break the quoted
+#      `join "..." wpakey "..."` directive.  Spaces/punctuation are legal.
+# ===========================================================================
+valid_wifi_value "home-net";   t_rc "wifi value plain accept"        0 $?
+valid_wifi_value "my wlan 5G"; t_rc "wifi value spaces accept"       0 $?
+valid_wifi_value 'p@ss-w0rd!'; t_rc "wifi value punctuation accept"  0 $?
+valid_wifi_value '';           t_rc "wifi value empty reject"        1 $?
+valid_wifi_value 'a"b';        t_rc "wifi value double-quote reject" 1 $?
+valid_wifi_value 'a\b';        t_rc "wifi value backslash reject"    1 $?
+# a value carrying an embedded newline must be refused (the injection vector).
+_WIFI_NL='home
+allow_root_login=yes'
+valid_wifi_value "$_WIFI_NL";  t_rc "wifi value newline reject (line-injection)" 1 $?
+
+# ===========================================================================
 #  5. profile_pkgs data table
 # ===========================================================================
 t_eq  "profile_pkgs minimal" "git curl nano" "$(profile_pkgs minimal)"
