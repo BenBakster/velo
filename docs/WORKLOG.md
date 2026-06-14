@@ -511,3 +511,45 @@ dedup+README, wifi-фикс, доки, PSK-долг, terminal-proposal, answers_
 
 **Что осталось (нужно железо/KVM — НЕ в облаке):** homely VGA-приёмка кириллицы +
 supervised metal re-test на внешнем SSD.
+
+### Сессия — 2026-06-14 (homely VGA/визуальная приёмка кириллицы — ✅ ЗАКРЫТА, локально/KVM)
+**Контекст:** хвост прошлой сессии — VGA-приёмка homely на живом KVM (qemu, `homely-test-target.img`,
+28 GiB FDE). Запускалось автономно по «делай всё»; push НЕ делался.
+
+**Сделано / находки (root-cause перед фиксом — [[feedback-verify-first]]):**
+1. **Прогнал `vm/homely-vga-accept.py`** на установленном FDE-образе. Скрипт отдал «PASS», но
+   глаза по screendump'ам: #2 xenodm-greeter рисуется идеально (графика/X работают), #3 openbox+tint2
+   ок, **#4 «xterm с кириллицей» — пустой рабочий стол, окна нет**. «PASS» был **ложно-зелёным**:
+   скрипт проверял только serial-факты (процессы, байты файла), пиксели не инспектировал.
+2. **Диагностика (`vm/homely-font-diag.py`):** опроверг первую гипотезу о «нет шрифта» —
+   DejaVu Sans Mono **есть** в base (`/usr/X11R6/.../DejaVuSansMono.ttf`, есть кириллица), плюс
+   полный Noto Sans Mono. НО: **base-xterm собран без Xft** (`ldd … | grep xft` пуст) → опция
+   `-fa`/`XTerm*faceName` в `.Xdefaults` им **игнорируется** (только core-шрифты). Это не причина
+   пустого окна — лишь мёртвая строка конфига.
+3. **Настоящий root-cause (`vm/homely-term-probe.py`):** запуск GUI делался
+   `su {USER} -s /bin/sh -c {script} &`. На **OpenBSD `su` флаг `-c` = login-class, НЕ команда**
+   (как на Linux). Скрипт-аргумент съедался как «класс», стартовал интерактивный шелл, читал EOF и
+   выходил — приложение не запускалось (`[1] + Done`/`Stopped (tty input)`), окно не появлялось.
+   Правильно: команда — **трейлинг-аргумент**: `su -l -s /bin/sh {USER} {script} </dev/null …`.
+4. **Доказано вживую (`term-3-xterm.png`):** с верным `su` **и terminator, и xterm рисуют
+   «Привіт / Привет»** (укр.+рус. кириллица), `xwininfo` подтвердил оба окна замапленными.
+5. **Продуктовый баг (terminator):** в его stderr `Unable to load configuration … First error at
+   line 24`. `site/etc/skel/.config/terminator/config` **дублировал** `[[[window0]]]`/`[[[child1]]]`
+   в `[layouts][[default]]` → ConfigObj падает, terminator стартует на дефолтах (кастомный шрифт/тема
+   не применялись). **Фикс:** убран дублирующий блок (commit `6ce49bb`).
+6. **Фикс харнесса** (`vm/homely-vga-accept.py`, в gitignored `/vm/` — НЕ в git): корректная
+   OpenBSD-форма `su`, `-u8` для xterm, + **честная проверка `XTERM_WINDOW_MAPPED` через `xwininfo`**
+   (чтобы «PASS» больше не был пустым). Канонический повторный прогон — `[PASS] XTERM_WINDOW_MAPPED`,
+   `vga-accept-4-xterm-cyrillic.png` показывает окно «VGA-Accept» с «Привіт / Привет».
+
+**Проверка:**
+- VGA-приёмка (canonical) — **PASS (rc=0)**, все 9 проверок зелёные, кириллица в xterm видна глазами.
+- terminator-конфиг — верифицирован тем же парсером, что у terminator: `configobj 5.0.8`
+  (исправленный парсится OK, исходный → `DuplicateError @ line 24`). Без перезагрузки ВМ.
+
+**Коммиты (локально, БЕЗ push):** `6ce49bb` fix(homely) terminator-конфиг. Правка харнесса —
+в `/vm/` (gitignored по конвенции репо), на диске для будущих прогонов.
+
+**Что осталось:** ⬜ **supervised metal re-test** на внешнем SSD (Ворота-СТОП, при Антоне) —
+инсталляторная дуга закрыта, это последнее физическое подтверждение. Опц. долг: косметика
+`.Xdefaults XTerm*faceName` (мёртв на base-xterm без Xft; кириллица всё равно идёт через core+`-u8`).

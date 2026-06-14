@@ -13,9 +13,18 @@
 > (пересборка после closure-fix: xfconf, xfce4-panel deps, cksum AFTER `3999777186`).
 > Целевой диск приёмки: `vm/homely-test-target.img` (28 GiB, FDE homely@L1).
 >
-> **Следующий шаг:** VGA/screenshot verify §4.3 SESSION-PLAN (кириллица **в xterm**,
-> panel/menu визуально); затем **(supervised) metal re-test** на внешнем SSD.
-> USB-носителя сейчас нет (затёрт 2026-06-08).
+> **VGA/visual acceptance — ✅ ЗАКРЫТА 2026-06-14 (KVM):** xenodm-greeter рисуется,
+> вход anon → openbox+tint2, **кириллица «Привіт / Привет» видна в xterm И terminator**
+> (`vm/vga-accept-4-xterm-cyrillic.png`, `vm/term-3-xterm.png`). Канон `homely-vga-accept.py`
+> теперь честный — добавлена проверка `XTERM_WINDOW_MAPPED` (раньше «PASS» был пустым:
+> serial-only, окна не было). Root-cause пустого окна: на OpenBSD `su -c` = login-class, НЕ
+> команда → GUI не запускался; фикс — трейлинг-арг `su -l -s /bin/sh USER SCRIPT </dev/null`.
+> Побочно: terminator-конфиг ломался (дубль layout, `6ce49bb`); base-xterm без Xft (faceName мёртв,
+> кириллица идёт через core+`-u8`).
+>
+> **Следующий шаг:** **(supervised) metal re-test** на внешнем SSD — последнее физическое
+> подтверждение (инсталляторная дуга и визуальная приёмка закрыты). USB-носителя сейчас нет
+> (затёрт 2026-06-08) → запись по `docs/OPERATIONS.md` Шаг 2 на отдельную флешку, Ворота-СТОП.
 >
 > **Повтор acceptance (test harness):** `bash vm/homely-accept.sh` (install → fix-ttys → firstboot → verify).
 > На уже установленном диске: `ln -sf homely-test-target.img vm/desktop-test-target.img &&
@@ -92,8 +101,9 @@
   раздел; reclaim `rm -rf` после успешного `pkg_add`).
 
 ## Осталось
-- **homely v0.2:** ⬜ VGA/visual acceptance (`vm/homely-vga-accept.py`, требует живого запуска) +
-  ⬜ supervised metal re-test на внешнем SSD.
+- **homely v0.2:** ✅ VGA/visual acceptance ЗАКРЫТА 2026-06-14 (KVM; кириллица в xterm+terminator,
+  `XTERM_WINDOW_MAPPED`, скриншоты в `/vm/`) + ⬜ supervised metal re-test на внешнем SSD.
+  Найдено+исправлено при приёмке: `su -c`-баг харнесса (OpenBSD) и дубль-layout terminator (`6ce49bb`).
 - **homely v0.2 — ЗАКРЫТО в qemu (serial):** firstboot offline `pkg_add` + verify пакетов/dotfiles.
 - **VGA acceptance script готов** (`vm/homely-vga-accept.py`, parse-checked): boot → FDE serial →
   xenodm sendkey login → screendumps → Cyrillic xterm → apps check → PASS/FAIL. Запускать только
