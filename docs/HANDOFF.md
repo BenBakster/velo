@@ -68,8 +68,11 @@
 
 ## Проверки (зелёные, oksh `/usr/sbin/ksh` + bash; прогон 2026-06-14)
 - `velo-install selftest` — **104/104**
-- `tests/velo-install-test.ksh` — **257/257** (+6c set-mask, +E/F/G homely size gate)
-- `tests/site-validate.ksh` — **124/124** (+closure validator parse-check)
+- `tests/velo-install-test.ksh` — **249/249** (post-recovery: homely size-gate
+  unit+behavioural restored, valid_wifi_value line-injection guard added,
+  replay-duplicated scrub block removed)
+- `tests/site-validate.ksh` — **115/115** (closure-validator parse-check restored,
+  replay-duplicated rc.local/torrc blocks removed)
 - `tests/integrity-test.ksh` — **27/27** (build-цепочка целостности; sha256-сайдкары)
 - `tests/check-pkg-closure-test.sh` — **11/11** (unit tests; run standalone с `sh`)
 - **LIVE (qemu/OVMF, реальный FDE-бокс, throwaway-диски):** T1 прямой egress

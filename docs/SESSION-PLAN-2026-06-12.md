@@ -31,7 +31,7 @@ Velo = **guided pre-installer для OpenBSD** (аналог Calamares на Linu
 | `site79.tgz` + `install.site.velo` | ✅ M2 |
 | Патч `bsd.rd`, сборка образа | ✅ M3 |
 | Metal install D/M4 (внешний SSD, FDE, hybrid) | ✅ 2026-06-08 |
-| Тесты (oksh+bash) | ✅ selftest 104, suite 238, site-validate 115, integrity 27 |
+| Тесты (oksh+bash) | ✅ selftest 104, suite 249, site-validate 115, integrity 27, closure 11 |
 | Build-цепочка целостности (signify fw + sha256) | ✅ 2026-06-11 |
 | Ворота-0 | ✅ installer framework (архив и SATYR-gateway отклонены) |
 
