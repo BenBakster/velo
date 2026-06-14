@@ -98,7 +98,9 @@
   supervised (нужен KVM + homely-test-target.img).
 - **VM hygiene script** (`build/vm-cleanup.sh`): dry-run по умолчанию, 76 кандидатов (~40 GiB).
   Запустить `--delete` только с явного ок Антона после просмотра кандидатов.
-- **`terminal` профиль:** backlog v0.3 — в код не добавлен; в SESSION-PLAN и PLAN.md помечен явно.
+- **`terminal` профиль:** backlog v0.3 — в код НЕ добавлен (граница «не добавлять до
+  Sprint-planing» соблюдена). Готова дизайн-спека `docs/terminal-profile-proposal.md`
+  (package list, точки интеграции, size-gate, план тестов) — к sprint-planning.
 - **Package closure validator:** stem-based (`build/check-pkg-closure.sh`); `--exact` режим;
   11 unit tests (`tests/check-pkg-closure-test.sh`). Версионные constraints — только через чистую
   OpenBSD 7.9 VM `pkg_add -n`.
