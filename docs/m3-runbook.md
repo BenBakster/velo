@@ -225,10 +225,10 @@ On the serial console confirm:
 Attach `velo79.img` as a raw/USB disk and a blank `.vdi` as the target; boot and
 verify (all of this is observable on the DRY-RUN build — nothing writes):
 - the velo TUI appears automatically,
-- the summary **Ворота-СТОП** defaults to **No**; choosing **Yes** PRINTS the
-  DRY-RUN plan and stops (the typed-confirm-word gate and the actual device write
-  are part of the *deferred M4* §2.3 wiring — `m3-requirements.md` carried item —
-  not built here),
+- the summary **Ворота-СТОП** defaults to **No**. The typed-confirm-word gate and
+  the destructive-execute path **exist** (§2.3 wiring, commit 92a88c2) and are
+  exercised for real in §5; for this non-destructive test-drive just **stop at the
+  gate** (leave the default **No**) — nothing writes,
 - **ESC at the welcome screen FALLS THROUGH to the stock OpenBSD menu**
   (`(I)nstall / (U)pgrade / (A)utoinstall / (S)hell`) — the hook is an *around*
   wrap inserted above the `while :; do` menu loop, not a replacement
@@ -253,8 +253,9 @@ verify (all of this is observable on the DRY-RUN build — nothing writes):
 > ##  stop, Anton present, never to sda.                                      ##
 > ############################################################################
 
-**M4 (supervised) — once the §2.3 wiring exists.** Boot `velo79.img` against the
-blank disk and walk the wizard:
+**VM install walk-through.** The §2.3 destructive-execute wiring **exists** (commit
+92a88c2) and ran live (S5–S9); M4 on real hardware is §6. Boot `velo79.img` against
+the blank disk and walk the wizard:
 
 1. welcome → **Begin** (Yes).
 2. disk → pick the **blank** target (e.g. `sd1` — confirm it is the empty one,
@@ -272,8 +273,8 @@ blank disk and walk the wizard:
 8. summary **Ворота-СТОП** → defaults to **No**; choose Yes and type the confirm
    word to proceed.
 
-velo then (**only once the §2.3 destructive-execute wiring exists — NOT in the
-frozen M1 DRY-RUN**) would, in the VM, on the blank disk:
+velo then, in the VM, on the blank disk, runs the §2.3 destructive-execute path
+(commit 92a88c2 — proven live S5–S9, no longer a frozen DRY-RUN):
 1. run the real `plan_crypto` sequence — `fdisk -iy -g -b 960` → `disklabel -E`
    one **RAID** slice → `bioctl -Cforce -cC -l<chunk>a -s softraid0`, **reading
    the new CRYPTO `sd` unit back from `bioctl softraid0`** (never hardcoded;
