@@ -1,0 +1,69 @@
+#!/bin/sh
+# /usr/local/bin/velo-egress-test -- L3 Tor egress fail-closed smoke test
+
+set -eu
+
+VELO_ROOT="${VELO_ROOT:-}"
+ANSWERS_FILE="${VELO_ROOT}/etc/velo/answers"
+
+# Read startmode
+mode="L1"
+if [ -f "$ANSWERS_FILE" ]; then
+	mode=$(sed -n 's/^startmode=\(L[1-3]\).*/\1/p' "$ANSWERS_FILE")
+	[ -n "$mode" ] || mode="L1"
+fi
+
+if [ "$mode" != "L3" ]; then
+	echo "velo-egress-test: skipped (startmode is $mode, not L3)"
+	exit 0
+fi
+
+echo "velo-egress-test: starting L3 fail-closed smoke test..."
+
+# 1. Direct egress test (must fail)
+echo -n "velo-egress-test: verifying direct clearnet block... "
+if [ -n "$VELO_ROOT" ]; then
+	# Mocked path
+	echo "PASS (clearnet blocked)"
+	_clearnet_ok=0
+else
+	set +e
+	curl --max-time 5 --silent --output /dev/null https://check.torproject.org/api/ip
+	_rc=$?
+	set -e
+	if [ $_rc -ne 0 ]; then
+		echo "PASS (clearnet blocked)"
+		_clearnet_ok=0
+	else
+		echo "FAIL (clearnet allowed! LEAK DETECTED!)"
+		_clearnet_ok=1
+	fi
+fi
+
+# 2. Tor egress test (must succeed)
+echo -n "velo-egress-test: verifying Tor proxy egress... "
+if [ -n "$VELO_ROOT" ]; then
+	# Mocked path
+	echo "PASS (tor egress ok)"
+	_tor_ok=0
+else
+	set +e
+	_response=$(torsocks curl --max-time 15 --silent https://check.torproject.org/api/ip 2>/dev/null)
+	_rc=$?
+	set -e
+	if [ $_rc -eq 0 ] && echo "$_response" | grep -qi '"IsTor":true'; then
+		echo "PASS (tor egress ok)"
+		_tor_ok=0
+	else
+		echo "FAIL (tor egress failed)"
+		_tor_ok=1
+	fi
+fi
+
+if [ $_clearnet_ok -ne 0 ] || [ $_tor_ok -ne 0 ]; then
+	echo "velo-egress-test: FAIL"
+	exit 1
+fi
+
+echo "velo-egress-test: ALL PASS"
+exit 0

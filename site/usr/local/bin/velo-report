@@ -1,0 +1,87 @@
+#!/bin/sh
+# /usr/local/bin/velo-report -- Sanity-scrubbed diagnostic bundle generator
+
+set -eu
+
+VELO_ROOT="${VELO_ROOT:-}"
+ANSWERS_FILE="${VELO_ROOT}/etc/velo/answers"
+TOR_LOG="${VELO_ROOT}/var/log/tor/log"
+
+echo "=== velo-report diagnostic bundle ==="
+echo "Date: $(date)"
+
+# 1. OS Info
+echo "--- OS info ---"
+if [ -n "$VELO_ROOT" ]; then
+	echo "OpenBSD 7.9 amd64 (mocked)"
+else
+	uname -a 2>/dev/null || echo "uname failed"
+fi
+
+# 2. Services
+echo "--- Services (rcctl ls on) ---"
+if [ -n "$VELO_ROOT" ]; then
+	echo "tor"
+	echo "pf"
+else
+	rcctl ls on 2>/dev/null || echo "rcctl failed"
+fi
+
+# 3. pf config
+echo "--- pf rules (pfctl -sr) ---"
+if [ -n "$VELO_ROOT" ] && [ -f "${VELO_ROOT}/etc/pf.conf" ]; then
+	cat "${VELO_ROOT}/etc/pf.conf"
+elif [ -z "$VELO_ROOT" ] && command -v pfctl >/dev/null 2>&1; then
+	pfctl -sr 2>/dev/null || echo "pfctl -sr failed"
+	pfctl -sn 2>/dev/null || echo "pfctl -sn failed"
+else
+	echo "pfctl not available"
+fi
+
+# 4. Network Interfaces (Sanitized MACs)
+echo "--- Network Interfaces (ifconfig) ---"
+if [ -n "$VELO_ROOT" ] && [ -f "${VELO_ROOT}/etc/ifconfig.mock" ]; then
+	_ifconfig_data=$(cat "${VELO_ROOT}/etc/ifconfig.mock")
+elif [ -z "$VELO_ROOT" ] && command -v ifconfig >/dev/null 2>&1; then
+	_ifconfig_data=$(ifconfig 2>/dev/null || echo "ifconfig failed")
+else
+	_ifconfig_data="ifconfig not available"
+fi
+
+# Redact MAC addresses: replace the last 3 octets with xx:xx:xx
+echo "$_ifconfig_data" | sed -E 's/([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}):[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}/\1:xx:xx:xx/g'
+
+# 5. Installed packages
+echo "--- Installed Packages (pkg_info) ---"
+if [ -n "$VELO_ROOT" ]; then
+	echo "git-2.53.0"
+	echo "curl-8.20.0"
+else
+	pkg_info 2>/dev/null || echo "pkg_info failed"
+fi
+
+# 6. answers file (Sanitized: NO keys, passphrases, secrets, or hashes)
+echo "--- velo answers (/etc/velo/answers) ---"
+if [ -f "$ANSWERS_FILE" ]; then
+	# Redact any line containing secret keywords
+	while IFS= read -r _line; do
+		case "$_line" in
+		""|"#"*) echo "$_line" ;;
+		*password*|*passphrase*|*key*|*psk*|*secret*|*hash*|*token*)
+			_key=${_line%%=*}
+			echo "$_key=[REDACTED]"
+			;;
+		*) echo "$_line" ;;
+		esac
+	done < "$ANSWERS_FILE"
+else
+	echo "answers file missing"
+fi
+
+# 7. Tor Logs (last 20 lines)
+echo "--- Tor Log (/var/log/tor/log) ---"
+if [ -f "$TOR_LOG" ]; then
+	tail -n 20 "$TOR_LOG" 2>/dev/null || cat "$TOR_LOG"
+else
+	echo "tor log missing or unreadable"
+fi
