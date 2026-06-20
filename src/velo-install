@@ -124,10 +124,19 @@ is_valid_disk() {
 
 # --- is_valid_size VAL : validate disklabel size string --------------------
 is_valid_size() {
-	case "$1" in
-	"") return 1 ;;
+	_sz=$1
+	case "$_sz" in
 	"*") return 0 ;;
-	*[!0-9MGTmgt]*) return 1 ;; # only digits and suffix M/G/T allowed
+	esac
+	# Check if the last char is a suffix and strip it
+	case "$_sz" in
+	*[MGTmgt])
+		_sz=${_sz%?}
+		;;
+	esac
+	# Now, _sz must be non-empty and consist only of digits
+	case "$_sz" in
+	""|*[!0-9]*) return 1 ;;
 	*) return 0 ;;
 	esac
 }
@@ -1791,6 +1800,26 @@ velo_execute() {
 	if [ "$_vx_ok" != yes ]; then
 		_putln "velo: ERROR -- encrypt(1) did not produce bcrypt hashes; aborting." >&2
 		VELO_S_ROOTPW_HASH=""; VELO_S_USERPW_HASH=""; return 1
+	fi
+	# Validate custom layout partition sizes before the destroy-gate.
+	if [ "$VELO_S_LAYOUT" = "custom" ]; then
+		_layout_ok=yes
+		for _part_sz in "$VELO_S_PART_SWAP" "$VELO_S_PART_TMP" "$VELO_S_PART_VAR" "$VELO_S_PART_USR" "$VELO_S_PART_USRLOCAL" "$VELO_S_PART_HOME"; do
+			if ! is_valid_size "$_part_sz"; then
+				_layout_ok=no
+			fi
+		done
+		if [ "$_layout_ok" != yes ]; then
+			_putln "velo: ERROR -- custom partition layout size(s) are invalid." >&2
+			_putln "velo: sizes must consist of digits followed by an optional unit (M, G, T), or '*'." >&2
+			return 1
+		fi
+		# Ensure swap is not zero
+		_swap_mib=$(size_to_mib "$VELO_S_PART_SWAP")
+		if [ "$_swap_mib" -le 0 ] && [ "$VELO_S_PART_SWAP" != "*" ]; then
+			_putln "velo: ERROR -- custom swap size cannot be empty or zero." >&2
+			return 1
+		fi
 	fi
 	# ----- TYPED DESTROY-GATE: the LAST human checkpoint, now with every precondition
 	# already proven.  Nothing below this line until velo_run_crypto is recoverable.

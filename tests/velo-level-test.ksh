@@ -110,6 +110,31 @@ t_has "torrc template deployed" "$(cat "$TMP/etc/tor/torrc" 2>/dev/null)" "velo 
 sh "$VELO_LEVEL" L1 >/dev/null; t_rc "switch to L1" 0 $?
 t_eq "torrc template cleaned up" 0 "$(if [ -f "$TMP/etc/tor/torrc" ]; then echo 1; else echo 0; fi)"
 
+# 6b. Test torrc backup & restore
+mkdir -p "$TMP/etc/tor"
+echo "# custom user configuration" > "$TMP/etc/tor/torrc"
+sh "$VELO_LEVEL" L3 >/dev/null; t_rc "switch to L3 with existing torrc" 0 $?
+t_eq "torrc backed up to torrc.orig" "# custom user configuration" "$(cat "$TMP/etc/tor/torrc.orig" 2>/dev/null)"
+t_has "torrc replaced with velo template" "$(cat "$TMP/etc/tor/torrc" 2>/dev/null)" "velo L3 template"
+sh "$VELO_LEVEL" L1 >/dev/null; t_rc "switch back to L1" 0 $?
+t_eq "torrc restored from backup" "# custom user configuration" "$(cat "$TMP/etc/tor/torrc" 2>/dev/null)"
+t_eq "torrc.orig removed after restore" 0 "$(if [ -f "$TMP/etc/tor/torrc.orig" ]; then echo 1; else echo 0; fi)"
+
+# 6c. Test rollback on switch failure
+_sysctl_before=$(cat "$TMP/etc/sysctl.conf" 2>/dev/null)
+_pf_before=$(cat "$TMP/etc/pf.conf" 2>/dev/null)
+mkdir "$TMP/etc/sysctl.conf.tmp"
+set +e
+sh "$VELO_LEVEL" L2 >/dev/null 2>&1; _rc=$?
+set -e
+t_rc "failed switch returns nonzero" 1 $_rc
+rmdir "$TMP/etc/sysctl.conf.tmp"
+t_eq "answers file startmode remains L1" "L1" "$(sed -n 's/^startmode=\(.*\)/\1/p' "$TMP/etc/velo/answers")"
+t_eq "sysctl.conf restored to state before failure" "$_sysctl_before" "$(cat "$TMP/etc/sysctl.conf" 2>/dev/null)"
+t_eq "pf.conf restored to state before failure" "$_pf_before" "$(cat "$TMP/etc/pf.conf" 2>/dev/null)"
+
+
+
 # 7. Invalid mode check
 set +e
 sh "$VELO_LEVEL" L4 >/dev/null 2>&1; _rc=$?

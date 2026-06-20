@@ -14,7 +14,7 @@ show_status() {
 		_mode=$(sed -n 's/^startmode=\(L[1-3]\).*/\1/p' "$ANSWERS_FILE")
 		[ -n "$_mode" ] || _mode="L1"
 	fi
-	
+
 	echo "velo: protection profile = $_mode"
 	
 	if [ -f "$PF_CONF" ]; then
@@ -87,86 +87,217 @@ if [ -n "$_dryrun" ]; then
 	exit 0
 fi
 
-# 1. Update pf.conf
-if [ -f "$PF_SRC" ]; then
-	cp "$PF_SRC" "$PF_CONF"
-	chmod 0600 "$PF_CONF"
-else
-	echo "Error: pf source config $PF_SRC missing." >&2
-	exit 1
-fi
-
-# 2. Update sysctl.conf
-if [ -f "$SYSCTL_SRC" ]; then
-	if [ -f "$SYSCTL_CONF" ]; then
-		sed '/# --- velo: L. sysctl deltas/,$d' "$SYSCTL_CONF" > "${SYSCTL_CONF}.tmp"
-		mv "${SYSCTL_CONF}.tmp" "$SYSCTL_CONF"
-	fi
-	{
-		echo ""
-		echo "# --- velo: ${cmd} sysctl deltas (appended by velo-level) ---"
-		cat "$SYSCTL_SRC"
-	} >> "$SYSCTL_CONF"
-	
-	# Apply sysctl settings live (only if not under VELO_ROOT)
+# Helper function for Tor management
+set_tor_state() {
+	_target_mode="$1"
 	if [ -z "${VELO_ROOT:-}" ]; then
-		while IFS= read -r _line; do
-			case "$_line" in
-			""|"#"*) continue ;;
-			esac
-			sysctl "$_line" >/dev/null 2>&1 || true
-		done < "$SYSCTL_SRC"
-	fi
-else
-	echo "Error: sysctl delta source $SYSCTL_SRC missing." >&2
-	exit 1
-fi
-
-# 3. Tor management
-if [ -z "${VELO_ROOT:-}" ]; then
-	if [ "$cmd" = "L3" ]; then
-		rcctl enable tor 2>/dev/null || true
-		if [ ! -f /etc/tor/torrc ]; then
+		if [ "$_target_mode" = "L3" ]; then
+			if ! rcctl enable tor; then
+				echo "Error: could not enable Tor service." >&2
+				return 1
+			fi
+			if [ -f /etc/tor/torrc ]; then
+				if ! grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' /etc/tor/torrc 2>/dev/null; then
+					if [ ! -f /etc/tor/torrc.orig ]; then
+						cp /etc/tor/torrc /etc/tor/torrc.orig
+					fi
+				fi
+			fi
 			mkdir -p /etc/tor 2>/dev/null || true
 			if [ -f /etc/velo/torrc ]; then
 				cp /etc/velo/torrc /etc/tor/torrc
 				chmod 0644 /etc/tor/torrc
 			fi
-		fi
-		rcctl start tor 2>/dev/null || rcctl reload tor 2>/dev/null || true
-	else
-		rcctl disable tor 2>/dev/null || true
-		rcctl stop tor 2>/dev/null || true
-		if [ -f /etc/tor/torrc ]; then
-			if grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' /etc/tor/torrc 2>/dev/null; then
-				rm -f /etc/tor/torrc
-				rmdir /etc/tor 2>/dev/null || true
+			if rcctl check tor >/dev/null 2>&1; then
+				if ! rcctl restart tor; then
+					echo "Error: failed to restart Tor." >&2
+					return 1
+				fi
+			else
+				if ! rcctl start tor; then
+					echo "Error: failed to start Tor." >&2
+					return 1
+				fi
+			fi
+			sleep 1
+			if ! rcctl check tor >/dev/null 2>&1; then
+				echo "Error: Tor daemon is not running after start." >&2
+				return 1
+			fi
+		else
+			rcctl stop tor 2>/dev/null || true
+			rcctl disable tor 2>/dev/null || true
+			if [ -f /etc/tor/torrc.orig ]; then
+				mv /etc/tor/torrc.orig /etc/tor/torrc
+			elif [ -f /etc/tor/torrc ]; then
+				if grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' /etc/tor/torrc 2>/dev/null; then
+					rm -f /etc/tor/torrc
+					rmdir /etc/tor 2>/dev/null || true
+				fi
 			fi
 		fi
-	fi
-else
-	# Under prefix/tests: mock tor file management
-	if [ "$cmd" = "L3" ]; then
-		if [ ! -f "${VELO_ROOT:-}/etc/tor/torrc" ]; then
+	else
+		# Under prefix/tests: mock tor file management
+		if [ "$_target_mode" = "L3" ]; then
+			if [ -f "${VELO_ROOT:-}/etc/tor/torrc" ]; then
+				if ! grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' "${VELO_ROOT:-}/etc/tor/torrc" 2>/dev/null; then
+					if [ ! -f "${VELO_ROOT:-}/etc/tor/torrc.orig" ]; then
+						cp "${VELO_ROOT:-}/etc/tor/torrc" "${VELO_ROOT:-}/etc/tor/torrc.orig"
+					fi
+				fi
+			fi
 			mkdir -p "${VELO_ROOT:-}/etc/tor" 2>/dev/null || true
 			if [ -f "${VELO_ROOT:-}/etc/velo/torrc" ]; then
 				cp "${VELO_ROOT:-}/etc/velo/torrc" "${VELO_ROOT:-}/etc/tor/torrc"
 			fi
-		fi
-	else
-		if [ -f "${VELO_ROOT:-}/etc/tor/torrc" ]; then
-			if grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' "${VELO_ROOT:-}/etc/tor/torrc" 2>/dev/null; then
-				rm -f "${VELO_ROOT:-}/etc/tor/torrc"
-				rmdir "${VELO_ROOT:-}/etc/tor" 2>/dev/null || true
+		else
+			if [ -f "${VELO_ROOT:-}/etc/tor/torrc.orig" ]; then
+				mv "${VELO_ROOT:-}/etc/tor/torrc.orig" "${VELO_ROOT:-}/etc/tor/torrc"
+			elif [ -f "${VELO_ROOT:-}/etc/tor/torrc" ]; then
+				if grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' "${VELO_ROOT:-}/etc/tor/torrc" 2>/dev/null; then
+					rm -f "${VELO_ROOT:-}/etc/tor/torrc"
+					rmdir "${VELO_ROOT:-}/etc/tor" 2>/dev/null || true
+				fi
 			fi
 		fi
+	fi
+	return 0
+}
+
+# Pre-flight check: validate pf rules syntax before we do any changes
+if [ -z "${VELO_ROOT:-}" ]; then
+	if [ -f "$PF_SRC" ]; then
+		if ! pfctl -nf "$PF_SRC"; then
+			echo "Error: pf configuration test failed for $PF_SRC (-n)." >&2
+			exit 1
+		fi
+	else
+		echo "Error: pf source config $PF_SRC missing." >&2
+		exit 1
+	fi
+fi
+
+# Keep track of previous mode for rollback
+_prev_mode="L1"
+if [ -f "$ANSWERS_FILE" ]; then
+	_prev_mode=$(sed -n 's/^startmode=\(L[1-3]\).*/\1/p' "$ANSWERS_FILE")
+	[ -n "$_prev_mode" ] || _prev_mode="L1"
+fi
+
+# Back up current configuration files
+PF_BACKUP=""
+SYSCTL_BACKUP=""
+if [ -f "$PF_CONF" ]; then
+	PF_BACKUP="${PF_CONF}.backup"
+	cp "$PF_CONF" "$PF_BACKUP"
+fi
+if [ -f "$SYSCTL_CONF" ]; then
+	SYSCTL_BACKUP="${SYSCTL_CONF}.backup"
+	cp "$SYSCTL_CONF" "$SYSCTL_BACKUP"
+fi
+
+set +e
+_failed=0
+
+# 1. Update pf.conf
+if [ -f "$PF_SRC" ]; then
+	cp "$PF_SRC" "$PF_CONF"
+	if [ $? -ne 0 ]; then
+		echo "Error: failed to copy $PF_SRC to $PF_CONF." >&2
+		_failed=1
+	else
+		chmod 0600 "$PF_CONF"
+	fi
+else
+	echo "Error: pf source config $PF_SRC missing." >&2
+	_failed=1
+fi
+
+# 2. Update sysctl.conf
+if [ $_failed -eq 0 ]; then
+	if [ -f "$SYSCTL_SRC" ]; then
+		if [ -f "$SYSCTL_CONF" ]; then
+			sed '/# --- velo: L. sysctl deltas/,$d' "$SYSCTL_CONF" > "${SYSCTL_CONF}.tmp"
+			if [ $? -ne 0 ]; then
+				echo "Error: failed to trim $SYSCTL_CONF." >&2
+				_failed=1
+			else
+				mv "${SYSCTL_CONF}.tmp" "$SYSCTL_CONF"
+			fi
+		fi
+		if [ $_failed -eq 0 ]; then
+			{
+				echo ""
+				echo "# --- velo: ${cmd} sysctl deltas (appended by velo-level) ---"
+				cat "$SYSCTL_SRC"
+			} >> "$SYSCTL_CONF"
+			if [ $? -ne 0 ]; then
+				echo "Error: failed to append sysctl deltas." >&2
+				_failed=1
+			fi
+		fi
+
+		# Apply sysctl settings live (only if not under VELO_ROOT)
+		if [ $_failed -eq 0 ] && [ -z "${VELO_ROOT:-}" ]; then
+			while IFS= read -r _line; do
+				case "$_line" in
+				""|"#"*) continue ;;
+				esac
+				sysctl "$_line" >/dev/null 2>&1
+			done < "$SYSCTL_SRC"
+		fi
+	else
+		echo "Error: sysctl delta source $SYSCTL_SRC missing." >&2
+		_failed=1
+	fi
+fi
+
+# 3. Tor management
+if [ $_failed -eq 0 ]; then
+	set_tor_state "$cmd"
+	if [ $? -ne 0 ]; then
+		echo "Error: Tor management failed." >&2
+		_failed=1
 	fi
 fi
 
 # 4. Load pf rules (only if not under VELO_ROOT)
-if [ -z "${VELO_ROOT:-}" ]; then
-	pfctl -f "$PF_CONF" 2>/dev/null || echo "Warning: could not reload pf rules via pfctl" >&2
+if [ $_failed -eq 0 ] && [ -z "${VELO_ROOT:-}" ]; then
+	if ! pfctl -f "$PF_CONF"; then
+		echo "Error: failed to load pf rules." >&2
+		_failed=1
+	fi
 fi
+
+# Rollback if anything failed
+if [ $_failed -ne 0 ]; then
+	echo "velo-level: switch failed! Rolling back changes..." >&2
+
+	# Restore pf.conf
+	if [ -n "$PF_BACKUP" ] && [ -f "$PF_BACKUP" ]; then
+		cp "$PF_BACKUP" "$PF_CONF"
+		chmod 0600 "$PF_CONF"
+		if [ -z "${VELO_ROOT:-}" ]; then
+			pfctl -f "$PF_CONF" >/dev/null 2>&1
+		fi
+	fi
+
+	# Restore sysctl.conf
+	if [ -n "$SYSCTL_BACKUP" ] && [ -f "$SYSCTL_BACKUP" ]; then
+		cp "$SYSCTL_BACKUP" "$SYSCTL_CONF"
+	fi
+
+	# Restore Tor state
+	set_tor_state "$_prev_mode" >/dev/null 2>&1
+
+	# Clean backups
+	rm -f "$PF_BACKUP" "$SYSCTL_BACKUP"
+	exit 1
+fi
+
+# Cleanup backups on success
+rm -f "$PF_BACKUP" "$SYSCTL_BACKUP"
+set -e
 
 # 5. Update answers file startmode
 if [ -f "$ANSWERS_FILE" ]; then

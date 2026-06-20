@@ -89,6 +89,9 @@ is_valid_size "*";     t_rc "is_valid_size * accept" 0 $?
 is_valid_size "";    t_rc "is_valid_size empty reject" 1 $?
 is_valid_size "2G "; t_rc "is_valid_size trailing-space reject" 1 $?
 is_valid_size "2;rm"; t_rc "is_valid_size injection reject" 1 $?
+is_valid_size "G";    t_rc "is_valid_size suffix-only reject" 1 $?
+is_valid_size "1GG";  t_rc "is_valid_size double-suffix reject" 1 $?
+is_valid_size "123MT"; t_rc "is_valid_size multi-suffix reject" 1 $?
 
 t_eq "size_to_mib 4G" "4096" "$(size_to_mib 4G)"
 t_eq "size_to_mib 250M" "250" "$(size_to_mib 250M)"
@@ -644,6 +647,50 @@ t_eq "mount-fail non-hybrid: NO 'install complete.'"  "no"  "$4"
 t_eq "mount-fail non-hybrid: says DEGRADED"           "yes" "$5"
 t_eq "mount-fail hybrid: FATAL rc1 (empty ESP)"       "1"   "$6"
 t_eq "mount-fail hybrid: efifill never reached"       "no"  "$7"
+
+# ---------------------------------------------------------------------------
+# 8f. BEHAVIOURAL: custom layout invalid partition sizes abort BEFORE the gate
+# ---------------------------------------------------------------------------
+_CUSTOM_ERR=$(
+	VELO_ALLOW_EXECUTE=yes
+	VELO_S_PROFILE=minimal
+	VELO_S_DISK=sd0
+	VELO_S_LAYOUT=custom
+	VELO_S_PART_SWAP="invalid"
+	VELO_S_PART_TMP="2G"
+	VELO_S_PART_VAR="4G"
+	VELO_S_PART_USR="2G"
+	VELO_S_PART_USRLOCAL="8G"
+	VELO_S_PART_HOME="*"
+	VELO_HAS_PRINT=1; VELO_S_ROOTPW=x; VELO_S_USERPW=x
+	velo_disk_probe()      { return 0; }
+	velo_disk_is_media()   { return 1; }
+	velo_find_media_disk() { echo sd1; return 0; }
+	is_valid_disk()        { return 0; }
+	encrypt()              { echo '$2b$10$stub'; }
+	velo_clear()               { return 0; }
+	velo_confirm_destructive() { _CONF=called; return 0; }
+	velo_run_crypto()          { _CRYP=called; return 0; }
+	mount() { return 0; }
+	_CONF=no; _CRYP=no
+	velo_execute >/dev/null 2>&1; _rcE=$?
+	_confE=$_CONF; _crypE=$_CRYP
+
+	# Test swap zero
+	VELO_S_PART_SWAP="0G"
+	_CONF=no; _CRYP=no
+	velo_execute >/dev/null 2>&1; _rcF=$?
+	_confF=$_CONF; _crypF=$_CRYP
+
+	echo "$_rcE|$_confE|$_crypE|$_rcF|$_confF|$_crypF"
+)
+_OIFS=$IFS; IFS='|'; set -- $_CUSTOM_ERR; IFS=$_OIFS
+t_eq "execute REFUSES (rc1) invalid partition sizes" "1" "$1"
+t_eq "invalid sizes aborted BEFORE confirm"          "no" "$2"
+t_eq "invalid sizes aborted BEFORE crypto"           "no" "$3"
+t_eq "execute REFUSES (rc1) swap zero size"          "1" "$4"
+t_eq "swap zero size aborted BEFORE confirm"          "no" "$5"
+t_eq "swap zero size aborted BEFORE crypto"           "no" "$6"
 
 # ===========================================================================
 #  9. confirm-twice mismatch logic (the pure predicate the wizard uses)
