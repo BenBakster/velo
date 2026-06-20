@@ -615,6 +615,48 @@ tui_password() {
 	done
 }
 
+# --- tui_spinner : show a spinner while a process runs ----------------------
+#
+# Usage:  tui_spinner PID MESSAGE [ROW COL]
+# Runs a spinner in a loop while the PID process is running.
+tui_spinner() {
+	_sp_pid=$1
+	_sp_msg=$2
+	_sp_row=${3:-}
+	_sp_col=${4:-}
+	_sp_idx=0
+
+	velo_hide_cursor
+	while kill -0 "$_sp_pid" 2>/dev/null; do
+		case "$_sp_idx" in
+		0) _sp_char='|' ;;
+		1) _sp_char='/' ;;
+		2) _sp_char='-' ;;
+		3) _sp_char='\' ;;
+		esac
+
+		if [ -n "$_sp_row" ] && [ -n "$_sp_col" ]; then
+			_goto "$_sp_row" "$_sp_col"
+		fi
+
+		velo_panel_on
+		_put "${_sp_msg} [ ${_sp_char} ]"
+		velo_reset
+
+		_sp_idx=$(( (_sp_idx + 1) % 4 ))
+		sleep 0.2
+	done
+
+	# Clean up spinner text
+	if [ -n "$_sp_row" ] && [ -n "$_sp_col" ]; then
+		_goto "$_sp_row" "$_sp_col"
+	fi
+	velo_panel_on
+	_repeat ' ' $(( ${#_sp_msg} + 6 ))
+	velo_reset
+	velo_show_cursor
+}
+
 # --- tui_msgbox : message box, dismissed with any key ----------------------
 #
 # Usage:  tui_msgbox X Y WIDTH TITLE LINE1 [LINE2 ...]
