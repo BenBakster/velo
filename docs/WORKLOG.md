@@ -553,3 +553,36 @@ supervised metal re-test на внешнем SSD.
 **Что осталось:** ⬜ **supervised metal re-test** на внешнем SSD (Ворота-СТОП, при Антоне) —
 инсталляторная дуга закрыта, это последнее физическое подтверждение. Опц. долг: косметика
 `.Xdefaults XTerm*faceName` (мёртв на base-xterm без Xft; кириллица всё равно идёт через core+`-u8`).
+
+### Сессия — 2026-06-20 (модернизация velo до v0.3 — ✅ ЗАКРЫТА, Т-800)
+**Контекст:** Реализация спринта v0.3 в автономном режиме. Цель: профиль `terminal`, утилита `velo-level`, средства диагностики `velo-report`/`velo-egress-test` и welcome MOTD.
+
+**Сделано:**
+1. **Профиль `terminal` (T1):**
+   - Создан список пакетов `site/usr/obj/_pkgs/terminal.list` (`xterm`, `noto-fonts`, `git`, `curl`, `vim`, `tmux`).
+   - Добавлен лимит `VELO_TERMINAL_MIN_BYTES=16GiB` (17179869184 байт).
+   - Расширен предикат `velo_profile_target_size_ok()` и whitelists в `src/velo-install`.
+   - Настроен запуск X11-сессии через `startx` (без `xenodm`) с помощью `.xsession-terminal` (запуск `xterm` с DejaVu Sans Mono шрифтом и поддержкой UTF-8/кириллицы).
+   - Внедрена выборочная установка opt-in пакетов (`ripgrep`, `jq`, `node`, `fzf`) на уровне TUI-чеклиста для профилей `homely` и `terminal`.
+2. **Утилита `velo-level` CLI (T2):**
+   - Разработан скрипт `site/usr/local/bin/velo-level` (0755, root:wheel).
+   - Реализована идемпотентная замена правил pf (`/etc/pf.conf` из шаблонов `pf.l[1-3].conf`) и sysctl жестко заданных блоков.
+   - Реализована интеграция с Tor (включение/выключение демона, развертывание и удаление конфига `/etc/tor/torrc` при переключении на L3/clearnet).
+   - Внесен doas-пермит `permit persist :wheel cmd /usr/local/bin/velo-level` в `doas.conf`.
+3. **Средства диагностики (T3):**
+   - Реализована утилита `site/usr/local/bin/velo-report` для сбора санитизированных данных (uname, pf-правила, ifconfig с маскированием MAC-адресов, установленные пакеты, answers без ключей и паролей, tor log).
+   - Добавлен smoke-тест `site/usr/local/bin/velo-egress-test` для L3 (блокировка клирнета и проверка Tor-прокси с помощью torsocks).
+4. **Welcome MOTD (T4):**
+   - Настроен `/etc/motd` в `install.site.velo` с двуязычным приветствием, информацией по кириллице в xterm и подсказкой для terminal (`startx`).
+5. **Документация и Таблица заимствований (T6):**
+   - Создана таблица `docs/v0.3-borrowing.md`.
+   - Обновлен `README.md` и `docs/HANDOFF.md`.
+
+**Проверка (bash + oksh):**
+- `velo-install-test` — **297** assertions (все PASS).
+- `site-validate` — **123** checks (все PASS).
+- `velo-level-test` — **15** assertions (все PASS).
+- `velo-report-test` — **9** assertions (все PASS).
+- `integrity-test` — **27** assertions (все PASS).
+- `check-pkg-closure-test` — **16** assertions (все PASS).
+- offline build `make-site-tgz.sh` — **SUCCESS**.

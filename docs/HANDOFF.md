@@ -1,17 +1,16 @@
-# velo — HANDOFF (после homely qemu acceptance, 2026-06-13)
+# velo — HANDOFF (после v0.3 release, 2026-06-20)
 
 Состояние на конец последней сессии. Подробности по сессиям — `docs/WORKLOG.md`;
 дизайн — `docs/m{0,1,2,3}-*.md`, `PLAN.md`. **Push:** при аварийном
 восстановлении 2026-06-14 содержимое опубликовано на GitHub
 (`docs/RECOVERY-2026-06-14.md`); дальнейший push — только по явному «пуш».
 
-> **➡️ СЛЕДУЮЩАЯ СЕССИЯ — НАЧНИ ОТСЮДА:** **homely qemu acceptance — ✅ ЗАКРЫТ**
-> (2026-06-13 вечер, Grok). Полный цикл на **28 GiB** target без переустановки:
-> firstboot `pkg_add OK` → `desktop-fix-ttys` → `homely-verify.py` **EXIT=0**.
-> Образ установочного носителя: `dist/velo79.img` sha256
-> `ce428e98028cb68db3e9f1aed4bbbcb12a0c8fb8e6759bc266504a2cc80244c8`
-> (пересборка после closure-fix: xfconf, xfce4-panel deps, cksum AFTER `3999777186`).
-> Целевой диск приёмки: `vm/homely-test-target.img` (28 GiB, FDE homely@L1).
+> **➡️ СЛЕДУЮЩАЯ СЕССИЯ — НАЧНИ ОТСЮДА:** **v0.3 release — ✅ ЗАКРЫТ**
+> (2026-06-20, Т-800). Профиль `terminal` и switcher `velo-level` полностью реализованы.
+> Все тесты (297 assertions в velo-install-test, 123 в site-validate, 15 в velo-level, 9 в velo-report) зеленые.
+> Образ установочного носителя: `dist/velo79.img`.
+>
+> **Следующий шаг:** **(supervised) terminal qemu acceptance** и **metal re-test** на внешнем SSD.
 >
 > **VGA/visual acceptance — ✅ ЗАКРЫТА 2026-06-14 (KVM):** xenodm-greeter рисуется,
 > вход anon → openbox+tint2, **кириллица «Привіт / Привет» видна в xterm И terminator**
@@ -110,9 +109,7 @@
   supervised (нужен KVM + homely-test-target.img).
 - **VM hygiene script** (`build/vm-cleanup.sh`): dry-run по умолчанию, 76 кандидатов (~40 GiB).
   Запустить `--delete` только с явного ок Антона после просмотра кандидатов.
-- **`terminal` профиль:** backlog v0.3 — в код НЕ добавлен (граница «не добавлять до
-  Sprint-planing» соблюдена). Готова дизайн-спека `docs/terminal-profile-proposal.md`
-  (package list, точки интеграции, size-gate, план тестов) — к sprint-planning.
+- **`terminal` профиль и `velo-level` CLI (v0.3):** ✅ РЕАЛИЗОВАНО. Профиль `terminal` (X + xterm + dev, лимит 16 GiB) полностью интегрирован. Утилита `velo-level`, диагностический `velo-report` и smoke-тест `velo-egress-test` развернуты и покрыты тестами.
 - **Package closure validator:** stem-based (`build/check-pkg-closure.sh`); `--exact` режим;
   11 unit tests (`tests/check-pkg-closure-test.sh`). Версионные constraints — только через чистую
   OpenBSD 7.9 VM `pkg_add -n`.
