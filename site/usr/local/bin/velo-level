@@ -1,0 +1,183 @@
+#!/bin/sh
+# /usr/local/bin/velo-level -- Switch or show the active protection level (L1/L2/L3)
+
+set -eu
+
+ANSWERS_FILE="${VELO_ROOT:-}/etc/velo/answers"
+PF_CONF="${VELO_ROOT:-}/etc/pf.conf"
+SYSCTL_CONF="${VELO_ROOT:-}/etc/sysctl.conf"
+LOG_FILE="${VELO_ROOT:-}/var/log/velo-level.log"
+
+show_status() {
+	_mode="L1"
+	if [ -f "$ANSWERS_FILE" ]; then
+		_mode=$(sed -n 's/^startmode=\(L[1-3]\).*/\1/p' "$ANSWERS_FILE")
+		[ -n "$_mode" ] || _mode="L1"
+	fi
+	
+	echo "velo: protection profile = $_mode"
+	
+	if [ -f "$PF_CONF" ]; then
+		_pf_hash=$(sha256 -q "$PF_CONF" 2>/dev/null || md5 -q "$PF_CONF" 2>/dev/null || echo "unknown")
+		_pf_lines=$(wc -l < "$PF_CONF" 2>/dev/null | tr -d ' ')
+		echo "velo: pf rules hash = $_pf_hash ($_pf_lines lines)"
+	else
+		echo "velo: pf rules = missing"
+	fi
+	
+	if [ -n "${VELO_ROOT:-}" ]; then
+		echo "velo: tor daemon = disabled (mocked under prefix)"
+	elif command -v rcctl >/dev/null 2>&1; then
+		if rcctl check tor >/dev/null 2>&1; then
+			echo "velo: tor daemon = running"
+		elif rcctl ls enabled | grep -q '^tor$'; then
+			echo "velo: tor daemon = enabled, not running"
+		else
+			echo "velo: tor daemon = disabled"
+		fi
+	else
+		echo "velo: tor daemon = (rcctl not available)"
+	fi
+}
+
+if [ $# -lt 1 ]; then
+	echo "Usage: velo-level [L1|L2|L3|status]" >&2
+	exit 1
+fi
+
+cmd="$1"
+
+if [ "$cmd" = "status" ]; then
+	show_status
+	exit 0
+fi
+
+if [ "$cmd" != "L1" ] && [ "$cmd" != "L2" ] && [ "$cmd" != "L3" ]; then
+	echo "Usage: velo-level [L1|L2|L3|status]" >&2
+	exit 1
+fi
+
+# Root check (skipped if VELO_LEVEL_TEST=1 or when running under fake root)
+if [ -z "${VELO_LEVEL_TEST:-}" ] && [ -z "${VELO_ROOT:-}" ] && [ "$(id -u)" -ne 0 ]; then
+	echo "Error: root privileges required (run with doas)." >&2
+	exit 1
+fi
+
+case "$cmd" in
+L1) lvl=l1 ;;
+L2) lvl=l2 ;;
+L3) lvl=l3 ;;
+esac
+
+PF_SRC="${VELO_ROOT:-}/etc/velo/pf/pf.${lvl}.conf"
+SYSCTL_SRC="${VELO_ROOT:-}/etc/velo/sysctl/sysctl.${lvl}.conf"
+
+_dryrun="${VELO_LEVEL_DRYRUN:-}"
+
+if [ -n "$_dryrun" ]; then
+	echo "velo-level: switching to $cmd (dry-run)"
+	if [ ! -f "$PF_SRC" ]; then
+		echo "Error: pf config $PF_SRC not found." >&2
+		exit 1
+	fi
+	if [ ! -f "$SYSCTL_SRC" ]; then
+		echo "Error: sysctl delta $SYSCTL_SRC not found." >&2
+		exit 1
+	fi
+	exit 0
+fi
+
+# 1. Update pf.conf
+if [ -f "$PF_SRC" ]; then
+	cp "$PF_SRC" "$PF_CONF"
+	chmod 0600 "$PF_CONF"
+else
+	echo "Error: pf source config $PF_SRC missing." >&2
+	exit 1
+fi
+
+# 2. Update sysctl.conf
+if [ -f "$SYSCTL_SRC" ]; then
+	if [ -f "$SYSCTL_CONF" ]; then
+		sed '/# --- velo: L. sysctl deltas/,$d' "$SYSCTL_CONF" > "${SYSCTL_CONF}.tmp"
+		mv "${SYSCTL_CONF}.tmp" "$SYSCTL_CONF"
+	fi
+	{
+		echo ""
+		echo "# --- velo: ${cmd} sysctl deltas (appended by velo-level) ---"
+		cat "$SYSCTL_SRC"
+	} >> "$SYSCTL_CONF"
+	
+	# Apply sysctl settings live (only if not under VELO_ROOT)
+	if [ -z "${VELO_ROOT:-}" ]; then
+		while IFS= read -r _line; do
+			case "$_line" in
+			""|"#"*) continue ;;
+			esac
+			sysctl "$_line" >/dev/null 2>&1 || true
+		done < "$SYSCTL_SRC"
+	fi
+else
+	echo "Error: sysctl delta source $SYSCTL_SRC missing." >&2
+	exit 1
+fi
+
+# 3. Tor management
+if [ -z "${VELO_ROOT:-}" ]; then
+	if [ "$cmd" = "L3" ]; then
+		rcctl enable tor 2>/dev/null || true
+		if [ ! -f /etc/tor/torrc ]; then
+			mkdir -p /etc/tor 2>/dev/null || true
+			if [ -f /etc/velo/torrc ]; then
+				cp /etc/velo/torrc /etc/tor/torrc
+				chmod 0644 /etc/tor/torrc
+			fi
+		fi
+		rcctl start tor 2>/dev/null || rcctl reload tor 2>/dev/null || true
+	else
+		rcctl disable tor 2>/dev/null || true
+		rcctl stop tor 2>/dev/null || true
+		if [ -f /etc/tor/torrc ]; then
+			if grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' /etc/tor/torrc 2>/dev/null; then
+				rm -f /etc/tor/torrc
+				rmdir /etc/tor 2>/dev/null || true
+			fi
+		fi
+	fi
+else
+	# Under prefix/tests: mock tor file management
+	if [ "$cmd" = "L3" ]; then
+		if [ ! -f "${VELO_ROOT:-}/etc/tor/torrc" ]; then
+			mkdir -p "${VELO_ROOT:-}/etc/tor" 2>/dev/null || true
+			if [ -f "${VELO_ROOT:-}/etc/velo/torrc" ]; then
+				cp "${VELO_ROOT:-}/etc/velo/torrc" "${VELO_ROOT:-}/etc/tor/torrc"
+			fi
+		fi
+	else
+		if [ -f "${VELO_ROOT:-}/etc/tor/torrc" ]; then
+			if grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' "${VELO_ROOT:-}/etc/tor/torrc" 2>/dev/null; then
+				rm -f "${VELO_ROOT:-}/etc/tor/torrc"
+				rmdir "${VELO_ROOT:-}/etc/tor" 2>/dev/null || true
+			fi
+		fi
+	fi
+fi
+
+# 4. Load pf rules (only if not under VELO_ROOT)
+if [ -z "${VELO_ROOT:-}" ]; then
+	pfctl -f "$PF_CONF" 2>/dev/null || echo "Warning: could not reload pf rules via pfctl" >&2
+fi
+
+# 5. Update answers file startmode
+if [ -f "$ANSWERS_FILE" ]; then
+	sed 's/^startmode=.*/startmode='"$cmd"'/' "$ANSWERS_FILE" > "${ANSWERS_FILE}.tmp"
+	mv "${ANSWERS_FILE}.tmp" "$ANSWERS_FILE"
+	chmod 0600 "$ANSWERS_FILE"
+fi
+
+# 6. Log changes
+touch "$LOG_FILE" 2>/dev/null || true
+chmod 0640 "$LOG_FILE" 2>/dev/null || true
+echo "$(date): switched protection profile to $cmd" >> "$LOG_FILE" 2>/dev/null || true
+
+echo "velo: successfully switched protection profile to $cmd."

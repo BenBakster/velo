@@ -1,0 +1,38 @@
+# /etc/tor/torrc -- velo L3 (Tor-only, fail-closed) companion.
+# Shipped in the static set; install.site KEEPS this only when startmode=L3 and
+# PRUNES it otherwise.  Under the L3 fail-closed pf the ONLY way out for any
+# program is Tor's SOCKS proxy below; every other path is blocked.
+#
+# Tor's default SOCKSPort is already 127.0.0.1:9050; we set it explicitly so the
+# contract with pf.l3.conf (apps egress via SOCKS, nothing direct) is visible here
+# too.  We deliberately do NOT enable a TransPort/DNSPort: this box is SOCKS-only
+# (see the rationale in /etc/velo/pf/pf.l3.conf), not a transparent gateway.
+#
+# CRITICAL for the fail-closed pf: tor MUST run as the _tor user so the pf rule
+# `pass out ... user _tor` matches its outbound sockets.  The OpenBSD rc framework
+# starts tor as root (rcctl tor_user defaults to root); without this directive tor
+# keeps root, its egress is NOT covered by the _tor pass rule, and `block all`
+# drops it -> tor can never bootstrap and the L3 box is a brick.  tor starts as
+# root, reads this, then drops to _tor; pf then sees _tor on every outbound conn.
+User _tor
+# DataDirectory MUST be set explicitly: tor is started by rc as root, so its
+# default DataDirectory resolves to root's home ($HOME/.tor -> /root/.tor), which
+# the _tor user it drops to cannot access -> "Couldn't access private data
+# directory" and tor exits.  The tor package ships /var/tor owned _tor:_tor for
+# exactly this; point tor at it so the privilege drop succeeds.
+DataDirectory /var/tor
+SOCKSPort 127.0.0.1:9050
+RunAsDaemon 1
+# --- best-anonymity hardening (defence-in-depth on top of the fail-closed pf) ---
+# SafeSocks rejects SOCKS4 and SOCKS5-to-a-literal-IP requests -- i.e. anything that
+# implies the app resolved DNS itself outside Tor.  torsocks uses SOCKS5 with the
+# HOSTNAME (Tor resolves), so it keeps working; only raw-IP-through-torsocks is
+# refused (deliberate -- it forces every name lookup through Tor, closing the
+# classic DNS-leak vector).
+SafeSocks 1
+# Only the local host may use the SOCKS proxy.  Redundant with the 127.0.0.1 bind
+# above (pf also blocks any LAN reach to 9050), but belt-and-suspenders.
+SocksPolicy accept 127.0.0.1/32
+SocksPolicy reject *
+# Pure Tor CLIENT: never act as a relay/bridge/exit, never publish a descriptor.
+ClientOnly 1
