@@ -58,9 +58,12 @@ echo "# L3 rules" > "$TMP/etc/velo/pf/pf.l3.conf"
 echo "net.inet.ip.forwarding=0" > "$TMP/etc/velo/sysctl/sysctl.l1.conf"
 echo "net.inet.ip.forwarding=0\nnet.inet6.ip6.forwarding=0" > "$TMP/etc/velo/sysctl/sysctl.l2.conf"
 echo "net.inet.ip.forwarding=0" > "$TMP/etc/velo/sysctl/sysctl.l3.conf"
-
-echo "# /etc/tor/torrc -- velo L3 template" > "$TMP/etc/velo/torrc"
-
+cat > "$TMP/etc/velo/torrc" << 'EOF'
+# /etc/tor/torrc -- velo L3 template
+User _tor
+DataDirectory /var/tor
+SOCKSPort 127.0.0.1:9050
+EOF
 cat > "$TMP/etc/velo/answers" <<ANS
 schema=1
 profile=terminal
@@ -133,7 +136,27 @@ t_eq "answers file startmode remains L1" "L1" "$(sed -n 's/^startmode=\(.*\)/\1/
 t_eq "sysctl.conf restored to state before failure" "$_sysctl_before" "$(cat "$TMP/etc/sysctl.conf" 2>/dev/null)"
 t_eq "pf.conf restored to state before failure" "$_pf_before" "$(cat "$TMP/etc/pf.conf" 2>/dev/null)"
 
+# 6d. Test switch to L3 fails if etc/velo/torrc is missing
+mv "$TMP/etc/velo/torrc" "$TMP/etc/velo/torrc.saved"
+set +e
+sh "$VELO_LEVEL" L3 >/dev/null 2>&1; _rc=$?
+set -e
+t_rc "switch to L3 with missing template returns nonzero" 1 $_rc
+mv "$TMP/etc/velo/torrc.saved" "$TMP/etc/velo/torrc"
 
+# 6e. Test switch to L3 fails if etc/velo/torrc lacks required options
+echo "# invalid torrc" > "$TMP/etc/velo/torrc"
+set +e
+sh "$VELO_LEVEL" L3 >/dev/null 2>&1; _rc=$?
+set -e
+t_rc "switch to L3 with invalid template returns nonzero" 1 $_rc
+# Restore correct template
+cat > "$TMP/etc/velo/torrc" << 'EOF'
+# /etc/tor/torrc -- velo L3 template
+User _tor
+DataDirectory /var/tor
+SOCKSPort 127.0.0.1:9050
+EOF
 
 # 7. Invalid mode check
 set +e

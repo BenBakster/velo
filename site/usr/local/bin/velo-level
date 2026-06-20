@@ -7,7 +7,15 @@ ANSWERS_FILE="${VELO_ROOT:-}/etc/velo/answers"
 PF_CONF="${VELO_ROOT:-}/etc/pf.conf"
 SYSCTL_CONF="${VELO_ROOT:-}/etc/sysctl.conf"
 LOG_FILE="${VELO_ROOT:-}/var/log/velo-level.log"
+PF_BACKUP=""
+SYSCTL_BACKUP=""
+SYSCTL_LIVE_BACKUP=""
 
+_prev_mode="L1"
+if [ -f "$ANSWERS_FILE" ]; then
+	_prev_mode=$(sed -n 's/^startmode=\(L[1-3]\).*/\1/p' "$ANSWERS_FILE")
+	[ -n "$_prev_mode" ] || _prev_mode="L1"
+fi
 show_status() {
 	_mode="L1"
 	if [ -f "$ANSWERS_FILE" ]; then
@@ -92,6 +100,17 @@ set_tor_state() {
 	_target_mode="$1"
 	if [ -z "${VELO_ROOT:-}" ]; then
 		if [ "$_target_mode" = "L3" ]; then
+			if [ ! -f /etc/velo/torrc ]; then
+				echo "Error: template /etc/velo/torrc is missing." >&2
+				return 1
+			fi
+			# Verify template torrc contains User _tor, DataDirectory /var/tor, and SOCKSPort 127.0.0.1:9050
+			if ! grep -q '^[[:space:]]*User[[:space:]][[:space:]]*_tor' /etc/velo/torrc || \
+			   ! grep -q '^[[:space:]]*DataDirectory[[:space:]][[:space:]]*/var/tor' /etc/velo/torrc || \
+			   ! grep -q '^[[:space:]]*SOCKSPort[[:space:]][[:space:]]*127\.0\.0\.1:9050' /etc/velo/torrc; then
+				echo "Error: template /etc/velo/torrc lacks required security/configuration parameters." >&2
+				return 1
+			fi
 			if ! rcctl enable tor; then
 				echo "Error: could not enable Tor service." >&2
 				return 1
@@ -104,10 +123,8 @@ set_tor_state() {
 				fi
 			fi
 			mkdir -p /etc/tor 2>/dev/null || true
-			if [ -f /etc/velo/torrc ]; then
-				cp /etc/velo/torrc /etc/tor/torrc
-				chmod 0644 /etc/tor/torrc
-			fi
+			cp /etc/velo/torrc /etc/tor/torrc
+			chmod 0644 /etc/tor/torrc
 			if rcctl check tor >/dev/null 2>&1; then
 				if ! rcctl restart tor; then
 					echo "Error: failed to restart Tor." >&2
@@ -139,6 +156,17 @@ set_tor_state() {
 	else
 		# Under prefix/tests: mock tor file management
 		if [ "$_target_mode" = "L3" ]; then
+			if [ ! -f "${VELO_ROOT:-}/etc/velo/torrc" ]; then
+				echo "Error: template ${VELO_ROOT:-}/etc/velo/torrc is missing." >&2
+				return 1
+			fi
+			# Verify template torrc contains User _tor, DataDirectory /var/tor, and SOCKSPort 127.0.0.1:9050
+			if ! grep -q '^[[:space:]]*User[[:space:]][[:space:]]*_tor' "${VELO_ROOT:-}/etc/velo/torrc" || \
+			   ! grep -q '^[[:space:]]*DataDirectory[[:space:]][[:space:]]*/var/tor' "${VELO_ROOT:-}/etc/velo/torrc" || \
+			   ! grep -q '^[[:space:]]*SOCKSPort[[:space:]][[:space:]]*127\.0\.0\.1:9050' "${VELO_ROOT:-}/etc/velo/torrc"; then
+				echo "Error: template ${VELO_ROOT:-}/etc/velo/torrc lacks required security/configuration parameters." >&2
+				return 1
+			fi
 			if [ -f "${VELO_ROOT:-}/etc/tor/torrc" ]; then
 				if ! grep -q -e '^# /etc/tor/torrc -- velo L3' -e '^# /etc/tor/torrc -- velo' "${VELO_ROOT:-}/etc/tor/torrc" 2>/dev/null; then
 					if [ ! -f "${VELO_ROOT:-}/etc/tor/torrc.orig" ]; then
@@ -147,9 +175,7 @@ set_tor_state() {
 				fi
 			fi
 			mkdir -p "${VELO_ROOT:-}/etc/tor" 2>/dev/null || true
-			if [ -f "${VELO_ROOT:-}/etc/velo/torrc" ]; then
-				cp "${VELO_ROOT:-}/etc/velo/torrc" "${VELO_ROOT:-}/etc/tor/torrc"
-			fi
+			cp "${VELO_ROOT:-}/etc/velo/torrc" "${VELO_ROOT:-}/etc/tor/torrc"
 		else
 			if [ -f "${VELO_ROOT:-}/etc/tor/torrc.orig" ]; then
 				mv "${VELO_ROOT:-}/etc/tor/torrc.orig" "${VELO_ROOT:-}/etc/tor/torrc"
@@ -164,6 +190,58 @@ set_tor_state() {
 	return 0
 }
 
+cleanup() {
+	if [ -n "${PF_BACKUP:-}" ] && [ -f "$PF_BACKUP" ]; then
+		rm -f "$PF_BACKUP"
+	fi
+	if [ -n "${SYSCTL_BACKUP:-}" ] && [ -f "$SYSCTL_BACKUP" ]; then
+		rm -f "$SYSCTL_BACKUP"
+	fi
+	if [ -n "${SYSCTL_LIVE_BACKUP:-}" ] && [ -f "$SYSCTL_LIVE_BACKUP" ]; then
+		rm -f "$SYSCTL_LIVE_BACKUP"
+	fi
+}
+
+do_rollback() {
+	# Restore pf.conf
+	if [ -n "${PF_BACKUP:-}" ] && [ -f "$PF_BACKUP" ]; then
+		cp "$PF_BACKUP" "$PF_CONF"
+		chmod 0600 "$PF_CONF"
+		if [ -z "${VELO_ROOT:-}" ]; then
+			pfctl -f "$PF_CONF" >/dev/null 2>&1
+		fi
+	fi
+
+	# Restore sysctl.conf
+	if [ -n "${SYSCTL_BACKUP:-}" ] && [ -f "$SYSCTL_BACKUP" ]; then
+		cp "$SYSCTL_BACKUP" "$SYSCTL_CONF"
+	fi
+
+	# Restore live sysctl values
+	if [ -z "${VELO_ROOT:-}" ] && [ -n "${SYSCTL_LIVE_BACKUP:-}" ] && [ -f "$SYSCTL_LIVE_BACKUP" ]; then
+		while IFS= read -r _line; do
+			case "$_line" in
+			""|"#"*) continue ;;
+			esac
+			sysctl "$_line" >/dev/null 2>&1
+		done < "$SYSCTL_LIVE_BACKUP"
+	fi
+
+	# Restore Tor state
+	set_tor_state "$_prev_mode" >/dev/null 2>&1
+}
+
+on_sig() {
+	trap '' INT TERM
+	echo "velo-level: Interrupted! Rolling back changes..." >&2
+	do_rollback
+	cleanup
+	exit 1
+}
+
+trap cleanup EXIT
+trap on_sig INT TERM
+
 # Pre-flight check: validate pf rules syntax before we do any changes
 if [ -z "${VELO_ROOT:-}" ]; then
 	if [ -f "$PF_SRC" ]; then
@@ -177,22 +255,13 @@ if [ -z "${VELO_ROOT:-}" ]; then
 	fi
 fi
 
-# Keep track of previous mode for rollback
-_prev_mode="L1"
-if [ -f "$ANSWERS_FILE" ]; then
-	_prev_mode=$(sed -n 's/^startmode=\(L[1-3]\).*/\1/p' "$ANSWERS_FILE")
-	[ -n "$_prev_mode" ] || _prev_mode="L1"
-fi
-
-# Back up current configuration files
-PF_BACKUP=""
-SYSCTL_BACKUP=""
+# Back up current configuration files using mktemp to avoid overwriting admin backups
 if [ -f "$PF_CONF" ]; then
-	PF_BACKUP="${PF_CONF}.backup"
+	PF_BACKUP=$(mktemp "${TMPDIR:-/tmp}/velo-pf-backup.XXXXXX")
 	cp "$PF_CONF" "$PF_BACKUP"
 fi
 if [ -f "$SYSCTL_CONF" ]; then
-	SYSCTL_BACKUP="${SYSCTL_CONF}.backup"
+	SYSCTL_BACKUP=$(mktemp "${TMPDIR:-/tmp}/velo-sysctl-backup.XXXXXX")
 	cp "$SYSCTL_CONF" "$SYSCTL_BACKUP"
 fi
 
@@ -237,13 +306,29 @@ if [ $_failed -eq 0 ]; then
 			fi
 		fi
 
-		# Apply sysctl settings live (only if not under VELO_ROOT)
+		# Apply sysctl settings live, backup original values, and check for errors
 		if [ $_failed -eq 0 ] && [ -z "${VELO_ROOT:-}" ]; then
+			SYSCTL_LIVE_BACKUP=$(mktemp "${TMPDIR:-/tmp}/velo-sysctl-rollback.XXXXXX")
 			while IFS= read -r _line; do
 				case "$_line" in
 				""|"#"*) continue ;;
 				esac
-				sysctl "$_line" >/dev/null 2>&1
+				_key="${_line%%=*}"
+
+				# Query current value of sysctl
+				_prev_val=$(sysctl -n "$_key" 2>/dev/null)
+				if [ $? -eq 0 ]; then
+					echo "${_key}=${_prev_val}" >> "$SYSCTL_LIVE_BACKUP"
+				else
+					echo "# ${_key} not readable" >> "$SYSCTL_LIVE_BACKUP"
+				fi
+
+				# Apply new value and check for failure
+				if ! sysctl "$_line" >/dev/null; then
+					echo "Error: failed to set sysctl $_line." >&2
+					_failed=1
+					break
+				fi
 			done < "$SYSCTL_SRC"
 		fi
 	else
@@ -272,31 +357,10 @@ fi
 # Rollback if anything failed
 if [ $_failed -ne 0 ]; then
 	echo "velo-level: switch failed! Rolling back changes..." >&2
-
-	# Restore pf.conf
-	if [ -n "$PF_BACKUP" ] && [ -f "$PF_BACKUP" ]; then
-		cp "$PF_BACKUP" "$PF_CONF"
-		chmod 0600 "$PF_CONF"
-		if [ -z "${VELO_ROOT:-}" ]; then
-			pfctl -f "$PF_CONF" >/dev/null 2>&1
-		fi
-	fi
-
-	# Restore sysctl.conf
-	if [ -n "$SYSCTL_BACKUP" ] && [ -f "$SYSCTL_BACKUP" ]; then
-		cp "$SYSCTL_BACKUP" "$SYSCTL_CONF"
-	fi
-
-	# Restore Tor state
-	set_tor_state "$_prev_mode" >/dev/null 2>&1
-
-	# Clean backups
-	rm -f "$PF_BACKUP" "$SYSCTL_BACKUP"
+	do_rollback
 	exit 1
 fi
 
-# Cleanup backups on success
-rm -f "$PF_BACKUP" "$SYSCTL_BACKUP"
 set -e
 
 # 5. Update answers file startmode
