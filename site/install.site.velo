@@ -150,7 +150,7 @@ case "$schema" in
 esac
 
 case "$profile" in
-minimal|homely|fortress) : ;;
+minimal|homely|fortress|terminal) : ;;
 *) log "WARN invalid profile='$profile' -> minimal"; profile=minimal ;;
 esac
 
@@ -315,9 +315,9 @@ velo_install_skel_tree() {
 	fi
 }
 
-if [ "$profile" = "homely" ]; then
+if [ "$profile" = "homely" ] || [ "$profile" = "terminal" ]; then
 	if [ -n "$VELO_DRYRUN" ]; then
-		log "DRYRUN: would install homely dotfiles for $VELO_USER (.xsession, .Xdefaults, .config/*)"
+		log "DRYRUN: would install $profile dotfiles for $VELO_USER (.xsession, .Xdefaults, etc.)"
 	else
 		# useradd records /home/$VELO_USER but may not create the directory before
 		# site79.tgz lands; lay it down explicitly so cp has a real target.
@@ -327,12 +327,16 @@ if [ "$profile" = "homely" ]; then
 		chmod 0750 "${VELO_ROOT}/home/${VELO_USER}" 2>/dev/null || true
 		velo_install_skel_file ".profile" ".profile"
 		velo_install_skel_file ".kshrc" ".kshrc"
-		velo_install_skel_file ".xsession" ".xsession"
 		velo_install_skel_file ".Xdefaults" ".Xdefaults"
 		velo_install_skel_file ".velo-xkb" ".velo-xkb"
-		velo_install_skel_tree ".config/openbox" ".config/openbox"
-		velo_install_skel_tree ".config/tint2" ".config/tint2"
-		velo_install_skel_tree ".config/terminator" ".config/terminator"
+		if [ "$profile" = "homely" ]; then
+			velo_install_skel_file ".xsession" ".xsession"
+			velo_install_skel_tree ".config/openbox" ".config/openbox"
+			velo_install_skel_tree ".config/tint2" ".config/tint2"
+			velo_install_skel_tree ".config/terminator" ".config/terminator"
+		else
+			velo_install_skel_file ".xsession-terminal" ".xsession"
+		fi
 	fi
 fi
 
@@ -347,15 +351,28 @@ if [ "$startmode" != "L3" ]; then
 	rmdir "${VELO_ROOT}/etc/tor" 2>/dev/null || true
 	log "pruned /etc/tor/torrc (startmode=$startmode != L3)"
 fi
-# xenodm Xsetup tweak + homely skel dotfiles only for homely.
+# xenodm Xsetup tweak only for homely.
 if [ "$profile" != "homely" ]; then
 	rm -f "${VELO_ROOT}/etc/X11/xenodm/Xsetup_0"
 	log "pruned /etc/X11/xenodm/Xsetup_0 (profile=$profile != homely)"
+fi
+# Dotfiles pruning in etc/skel.
+if [ "$profile" != "homely" ] && [ "$profile" != "terminal" ]; then
 	rm -f "${VELO_ROOT}/etc/skel/.xsession" \
 		"${VELO_ROOT}/etc/skel/.Xdefaults" \
-		"${VELO_ROOT}/etc/skel/.velo-xkb"
+		"${VELO_ROOT}/etc/skel/.velo-xkb" \
+		"${VELO_ROOT}/etc/skel/.xsession-terminal"
 	rm -rf "${VELO_ROOT}/etc/skel/.config"
-	log "pruned /etc/skel homely dotfiles (profile=$profile != homely)"
+	log "pruned /etc/skel homely/terminal dotfiles (profile=$profile != homely/terminal)"
+elif [ "$profile" = "homely" ]; then
+	rm -f "${VELO_ROOT}/etc/skel/.xsession-terminal"
+	log "pruned terminal skel files (profile=homely)"
+elif [ "$profile" = "terminal" ]; then
+	rm -f "${VELO_ROOT}/etc/skel/.xsession"
+	rm -rf "${VELO_ROOT}/etc/skel/.config"
+	log "pruned homely skel files (profile=terminal)"
+fi
+if [ "$profile" != "homely" ]; then
 	rm -f "${VELO_ROOT}/etc/hostname.iwm0" "${VELO_ROOT}/etc/hostname.em0"
 	log "pruned hostname.iwm0/em0 (profile=$profile != homely)"
 fi
@@ -578,6 +595,20 @@ EOF
 	chmod 0644 "$_rl_dst" 2>/dev/null || true
 	log "appended pf re-assert to /etc/rc.local (boot-time fail-closed invariant)"
 fi
+
+# ---------------------------------------------------------------------------
+# 9c. MOTD welcome message -- configure /etc/motd
+# ---------------------------------------------------------------------------
+_motd_dst="${VELO_ROOT}/etc/motd"
+{
+	echo "velo: protection profile = see 'velo-level status'."
+	echo "Cyrillic: use xterm (wscons console has no Cyrillic -- OpenBSD limitation)."
+	echo "Кириллица: используйте xterm (в wscons консоли кириллица отсутствует)."
+	if [ "$profile" = "terminal" ]; then
+		echo "Start graphics: startx / Запуск графики: startx"
+	fi
+} >"$_motd_dst"
+log "configured /etc/motd"
 
 # ---------------------------------------------------------------------------
 # 10. Cleanup.  Keep /etc/velo/answers as an audit record but tighten perms.

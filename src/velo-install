@@ -53,7 +53,7 @@ VELO_S_DISK=${VELO_S_DISK:-""}            # raw device, validated ^sd|wd  (scree
 VELO_S_ENCRYPT=${VELO_S_ENCRYPT:-no}      # yes|no                        (screen 2)
 VELO_S_PASSPHRASE=${VELO_S_PASSPHRASE:-""} # secret; lives ONLY here; cleared after
 VELO_S_HOSTNAME=${VELO_S_HOSTNAME:-""}    # RFC-1123 label                (screen 3)
-VELO_S_PROFILE=${VELO_S_PROFILE:-""}      # homely|minimal|fortress       (screen 4)
+VELO_S_PROFILE=${VELO_S_PROFILE:-""}      # homely|minimal|fortress|terminal (screen 4)
 VELO_S_PKGS=${VELO_S_PKGS:-""}            # space-separated package names (screen 5)
 VELO_S_STARTMODE=${VELO_S_STARTMODE:-""}  # L1|L2|L3                      (screen 6)
 VELO_S_BOOTMODE=${VELO_S_BOOTMODE:-same}  # same|uefi|bios target firmware (screen 8b, FDE only)
@@ -73,6 +73,13 @@ VELO_S_ROOTPW=${VELO_S_ROOTPW:-""}        # secret: root account password   (scr
 VELO_S_USERPW=${VELO_S_USERPW:-""}        # secret: anon account password   (screen 4)
 VELO_S_WIFI_SSID=${VELO_S_WIFI_SSID:-""} # Wi-Fi network name (optional)   (screen 6)
 VELO_S_WIFI_PSK=${VELO_S_WIFI_PSK:-""}   # secret: WPA key; cleared after execute
+VELO_S_LAYOUT=${VELO_S_LAYOUT:-auto}      # auto|custom
+VELO_S_PART_SWAP=${VELO_S_PART_SWAP:-4G}
+VELO_S_PART_TMP=${VELO_S_PART_TMP:-2G}
+VELO_S_PART_VAR=${VELO_S_PART_VAR:-4G}
+VELO_S_PART_USR=${VELO_S_PART_USR:-2G}
+VELO_S_PART_USRLOCAL=${VELO_S_PART_USRLOCAL:-8G}
+VELO_S_PART_HOME=${VELO_S_PART_HOME:-*}
 # Internal bcrypt hashes -- deliberately NOT env-seedable (no ${VAR:-} seam):
 # they are computed ONLY inside velo_execute, from the plaintext above, via
 # encrypt(1).  Empty -> gen_install_conf emits the <bcrypt-hash> placeholder, so
@@ -83,7 +90,7 @@ VELO_S_USERPW_HASH=""                     # set ONLY inside velo_execute
 # Stable, ordered option lists.  These are the single source of truth for
 # both the menus AND the idx_to_* mappers, so the displayed order and the
 # re-indexed value can never diverge (M1 req §3).
-VELO_PROFILES="homely minimal fortress"   # homely first = default desktop
+VELO_PROFILES="homely minimal fortress terminal"   # homely first = default desktop
 VELO_STARTMODES="L1 L2 L3"                  # L1 first = permissive baseline
 VELO_BOOTMODES="same uefi bios hybrid"       # same first = auto-detect (safe default)
 
@@ -114,6 +121,36 @@ is_valid_disk() {
 	esac
 	return 0
 }
+
+# --- is_valid_size VAL : validate disklabel size string --------------------
+is_valid_size() {
+	case "$1" in
+	"") return 1 ;;
+	"*") return 0 ;;
+	*[!0-9MGTmgt]*) return 1 ;; # only digits and suffix M/G/T allowed
+	*) return 0 ;;
+	esac
+}
+
+# --- size_to_mib VAL : convert size string to MiB (integer) -----------------
+size_to_mib() {
+	_sz=$1
+	case "$_sz" in
+	""|"*") echo 0; return 0 ;;
+	esac
+	# extract numeric part
+	_sz_val=${_sz%[MGTmgt]}
+	_sz_unit=${_sz#$_sz_val}
+	case "$_sz_val" in
+	''|*[!0-9]*) echo 0; return 0 ;;
+	esac
+	case "$_sz_unit" in
+	[Gg]) echo $((_sz_val * 1024)) ;;
+	[Tt]) echo $((_sz_val * 1024 * 1024)) ;;
+	*)    echo "$_sz_val" ;; # default to M/MiB or bytes. We treat suffixless as MiB
+	esac
+}
+
 
 # --- velo_list_disks : INJECTABLE disk detection ---------------------------
 # Prints whitelisted disk names, one per line, order preserved.
@@ -234,6 +271,7 @@ profile_pkgs() {
 	minimal)  _put "git curl nano" ;;
 	homely)   _put "openbox tint2 terminator firefox git curl nano noto-fonts thunar mpv" ;;
 	fortress) _put "tor torsocks wireguard-tools gnupg pwgen git nano" ;;
+	terminal) _put "xterm noto-fonts git curl vim tmux" ;;
 	*) return 1 ;;
 	esac
 	return 0
@@ -484,7 +522,7 @@ gen_install_conf() {
 	case "$VELO_S_PROFILE" in
 	minimal)  _gic_sets="+* -game* -xbase* -xfont* -xserv* -xshare*" ;;
 	fortress) _gic_sets="+* -game*" ;;
-	*)        _gic_sets="+* -game*" ;;   # homely/default keep x11
+	*)        _gic_sets="+* -game*" ;;   # homely/terminal/default keep x11
 	esac
 
 	# Set-location answers (the four install.sub prompts after "Location of sets =
@@ -542,7 +580,11 @@ gen_install_conf() {
 	_putln "Allow root ssh login = no"
 	_putln "What timezone are you in = Europe/Kiev"
 	_putln "Which disk is the root disk = ${_gic_root}"
-	_putln "Use (A)uto layout = auto"
+	if [ "$VELO_S_LAYOUT" = "custom" ]; then
+		_putln "URL to autopartitioning template for disklabel = file:///tmp/custom.disklabel"
+	else
+		_putln "Use (A)uto layout = auto"
+	fi
 	_putln "Location of sets = disk"
 	# The four set-location follow-ups install.sub asks after "= disk".  EXACT 7.9
 	# prompt wording transcribed from the 2026-06-08 Fujitsu console, so the
@@ -591,7 +633,7 @@ velo_plan() {
 	valid_hostname "$VELO_S_HOSTNAME" || VELO_S_HOSTNAME="velo-bsd"
 
 	VELO_S_PROFILE=${VELO_S_PROFILE:-homely}
-	case "$VELO_S_PROFILE" in homely|minimal|fortress) : ;; *) VELO_S_PROFILE="homely" ;; esac
+	case "$VELO_S_PROFILE" in homely|minimal|fortress|terminal) : ;; *) VELO_S_PROFILE="homely" ;; esac
 
 	VELO_S_STARTMODE=${VELO_S_STARTMODE:-L1}
 	case "$VELO_S_STARTMODE" in L1|L2|L3) : ;; *) VELO_S_STARTMODE="L1" ;; esac
@@ -609,6 +651,27 @@ velo_plan() {
 	case "$VELO_S_MEDIAPATH" in ''|*[!A-Za-z0-9./_-]*) VELO_S_MEDIAPATH="7.9/amd64" ;; esac
 
 	VELO_S_PKGS=${VELO_S_PKGS:-$(profile_pkgs "$VELO_S_PROFILE")}
+
+	VELO_S_LAYOUT=${VELO_S_LAYOUT:-auto}
+	case "$VELO_S_LAYOUT" in auto|custom) : ;; *) VELO_S_LAYOUT="auto" ;; esac
+
+	VELO_S_PART_SWAP=${VELO_S_PART_SWAP:-4G}
+	is_valid_size "$VELO_S_PART_SWAP" || VELO_S_PART_SWAP="4G"
+
+	VELO_S_PART_TMP=${VELO_S_PART_TMP:-2G}
+	is_valid_size "$VELO_S_PART_TMP" || VELO_S_PART_TMP="2G"
+
+	VELO_S_PART_VAR=${VELO_S_PART_VAR:-4G}
+	is_valid_size "$VELO_S_PART_VAR" || VELO_S_PART_VAR="4G"
+
+	VELO_S_PART_USR=${VELO_S_PART_USR:-2G}
+	is_valid_size "$VELO_S_PART_USR" || VELO_S_PART_USR="2G"
+
+	VELO_S_PART_USRLOCAL=${VELO_S_PART_USRLOCAL:-8G}
+	is_valid_size "$VELO_S_PART_USRLOCAL" || VELO_S_PART_USRLOCAL="8G"
+
+	VELO_S_PART_HOME=${VELO_S_PART_HOME:-*}
+	is_valid_size "$VELO_S_PART_HOME" || VELO_S_PART_HOME="*"
 
 	# Derive the root disk: raw disk for plaintext, crypto placeholder for FDE.
 	if [ "$VELO_S_ENCRYPT" = "yes" ]; then
@@ -683,6 +746,7 @@ VELO_MEDIA_MAX_BYTES=${VELO_MEDIA_MAX_BYTES:-137438953472}   # 128 GiB
 # inconsistent on the next boot.  Refuse homely targets below 28 GiB before the
 # typed destroy gate; an unknown size is also a refusal, never a guess.
 VELO_HOMELY_MIN_BYTES=30064771072   # 28 GiB
+VELO_TERMINAL_MIN_BYTES=17179869184 # 16 GiB
 
 # velo_disk_probe DISK -- run `disklabel DISK` ONCE (read-only, no -E) and stash
 # size / sector-size / DUID / raw-label in globals (_VDP_*).  Any field that is
@@ -712,12 +776,18 @@ velo_disk_probe() {
 velo_profile_target_size_ok() {
 	_vptso_disk=$1
 	_vptso_profile=$2
-	[ "$_vptso_profile" = homely ] || return 0
+	if [ "$_vptso_profile" = homely ]; then
+		_vptso_min=$VELO_HOMELY_MIN_BYTES
+	elif [ "$_vptso_profile" = terminal ]; then
+		_vptso_min=$VELO_TERMINAL_MIN_BYTES
+	else
+		return 0
+	fi
 	velo_disk_probe "$_vptso_disk" || return 1
 	case "$_VDP_SECT" in ''|*[!0-9]*) return 1 ;; esac
 	case "$_VDP_BPS"  in ''|*[!0-9]*) return 1 ;; esac
 	[ "$_VDP_SECT" -gt 0 ] && [ "$_VDP_BPS" -gt 0 ] || return 1
-	[ $(( _VDP_SECT * _VDP_BPS )) -ge "$VELO_HOMELY_MIN_BYTES" ]
+	[ $(( _VDP_SECT * _VDP_BPS )) -ge "$_vptso_min" ]
 }
 
 # velo_human_size BYTES -> e.g. "16.0G" (GiB, binary).  Pure ksh integer math (no
@@ -1014,7 +1084,7 @@ _wiz_encrypt() {
 _wiz_rootpw() {
 	while :; do
 		velo_clear
-		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 3/$_wz_total: Root account password"
+		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 4/$_wz_total: Root account password"
 		_wiz_help "back"
 		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) "password:" \
 			|| return 1
@@ -1039,7 +1109,7 @@ _wiz_rootpw() {
 _wiz_userpw() {
 	while :; do
 		velo_clear
-		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 4/$_wz_total: User (anon) password"
+		tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 5/$_wz_total: User (anon) password"
 		_wiz_help "back"
 		tui_password $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) "password:" \
 			|| return 1
@@ -1061,7 +1131,7 @@ _wiz_userpw() {
 # Returns 0 on confirm, 1 on ESC/back.
 _wiz_hostname() {
 	velo_clear
-	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 5/$_wz_total: Hostname"
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 6/$_wz_total: Hostname"
 	_wiz_help "back"
 	while :; do
 		tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) "hostname:" \
@@ -1117,6 +1187,13 @@ velo_answers_body() {
 	else
 		_putln "wifi_ssid="
 	fi
+	_putln "layout=$VELO_S_LAYOUT"
+	_putln "part_swap=$VELO_S_PART_SWAP"
+	_putln "part_tmp=$VELO_S_PART_TMP"
+	_putln "part_var=$VELO_S_PART_VAR"
+	_putln "part_usr=$VELO_S_PART_USR"
+	_putln "part_usrlocal=$VELO_S_PART_USRLOCAL"
+	_putln "part_home=$VELO_S_PART_HOME"
 }
 
 # Returns 0 on confirm/skip, 1 on ESC/back.  Optional screen: blank SSID skips
@@ -1126,7 +1203,7 @@ velo_answers_body() {
 # audit file.  PSK is scrubbed with the other secrets after execute.
 _wiz_wifi() {
 	velo_clear
-	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 6/$_wz_total: Wi-Fi (optional)"
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 6 "Step 7/$_wz_total: Wi-Fi (optional)"
 	_wiz_help "back"
 	while :; do
 		tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) $((VELO_BOX_W - 4)) \
@@ -1163,10 +1240,11 @@ _wiz_profile() {
 	velo_clear
 	_wiz_help "back"
 	# Build labels in the SAME order as VELO_PROFILES so idx_to_profile maps.
-	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 7/$_wz_total: Profile" \
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 8/$_wz_total: Profile" \
 		"homely   -- openbox home desktop" \
 		"minimal  -- base only + a few tools" \
-		"fortress -- anonymity / privacy stack" || return 1
+		"fortress -- anonymity / privacy stack" \
+		"terminal -- X + xterm + dev, no DE" || return 1
 	_wp_name=$(idx_to_profile "$VELO_RADIO_INDEX") || return 1
 	VELO_S_PROFILE=$_wp_name
 	return 0
@@ -1181,10 +1259,13 @@ _wiz_packages() {
 		VELO_S_PKGS=""
 		return 0
 	fi
+	if [ "$VELO_S_PROFILE" = homely ] || [ "$VELO_S_PROFILE" = terminal ]; then
+		_wpk_universe="$_wpk_universe ripgrep jq node fzf"
+	fi
 	_wiz_help "back"
 	# shellcheck disable=SC2086
 	tui_checklist "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" \
-		"Step 8/$_wz_total: Packages for $VELO_S_PROFILE (SPACE toggles)" $_wpk_universe \
+		"Step 9/$_wz_total: Packages for $VELO_S_PROFILE (SPACE toggles)" $_wpk_universe \
 		|| return 1
 	# Map checked indices back to names from the SAME universe (M1 req §3).
 	VELO_S_PKGS=$(idxset_to_pkgs "$VELO_CHECKED" $_wpk_universe)
@@ -1195,7 +1276,7 @@ _wiz_packages() {
 _wiz_startmode() {
 	velo_clear
 	_wiz_help "back"
-	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 9/$_wz_total: Protection level (records only in v0.1)" \
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 10/$_wz_total: Protection level (records only in v0.1)" \
 		"L1 -- encrypted homely baseline" \
 		"L2 -- reduced network surface (IPv6 off)" \
 		"L3 -- Tor-only fail-closed (only _tor out)" || return 1
@@ -1212,7 +1293,7 @@ _wiz_startmode() {
 _wiz_bootmode() {
 	velo_clear
 	_wiz_help "back"
-	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 10/$_wz_total: Target firmware / partition table (FDE)" \
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 11/$_wz_total: Target firmware / partition table (FDE)" \
 		"same -- match THIS machine's firmware (auto-detect)" \
 		"uefi -- force GPT + EFI system partition" \
 		"bios -- force legacy MBR (older machines)" \
@@ -1221,6 +1302,100 @@ _wiz_bootmode() {
 	VELO_S_BOOTMODE=$_wbm_name
 	return 0
 }
+# Returns 0 on confirm, 1 on ESC/back.
+_wiz_layout() {
+	velo_clear
+	_wiz_help "back"
+	tui_radio "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Step 3/$_wz_total: Partition layout" \
+		"auto   -- standard OpenBSD automatic layout" \
+		"custom -- adjust partition sizes manually" || return 1
+	if [ "$VELO_RADIO_INDEX" = 1 ]; then
+		VELO_S_LAYOUT="custom"
+		while :; do
+			velo_clear
+			_wiz_help "back"
+			# Present menu of partitions and their current sizes
+			tui_menu "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" "Customize sizes (MB/GB or *)" \
+				"swap size:       $VELO_S_PART_SWAP" \
+				"/tmp size:       $VELO_S_PART_TMP" \
+				"/var size:       $VELO_S_PART_VAR" \
+				"/usr size:       $VELO_S_PART_USR" \
+				"/usr/local size: $VELO_S_PART_USRLOCAL" \
+				"/home size:      $VELO_S_PART_HOME (remainder)" \
+				"Confirm layout" || return 1
+			case "$VELO_MENU_INDEX" in
+			0) # swap
+				tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) $((VELO_BOX_W - 4)) "swap:" "$VELO_S_PART_SWAP"
+				if is_valid_size "$VELO_INPUT"; then VELO_S_PART_SWAP=$VELO_INPUT; fi
+				;;
+			1) # /tmp
+				tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) $((VELO_BOX_W - 4)) "/tmp:" "$VELO_S_PART_TMP"
+				if is_valid_size "$VELO_INPUT"; then VELO_S_PART_TMP=$VELO_INPUT; fi
+				;;
+			2) # /var
+				tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) $((VELO_BOX_W - 4)) "/var:" "$VELO_S_PART_VAR"
+				if is_valid_size "$VELO_INPUT"; then VELO_S_PART_VAR=$VELO_INPUT; fi
+				;;
+			3) # /usr
+				tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) $((VELO_BOX_W - 4)) "/usr:" "$VELO_S_PART_USR"
+				if is_valid_size "$VELO_INPUT"; then VELO_S_PART_USR=$VELO_INPUT; fi
+				;;
+			4) # /usr/local
+				tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) $((VELO_BOX_W - 4)) "/usr/local:" "$VELO_S_PART_USRLOCAL"
+				if is_valid_size "$VELO_INPUT"; then VELO_S_PART_USRLOCAL=$VELO_INPUT; fi
+				;;
+			5) # /home
+				tui_input $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) $((VELO_BOX_W - 4)) "/home:" "$VELO_S_PART_HOME"
+				if is_valid_size "$VELO_INPUT"; then VELO_S_PART_HOME=$VELO_INPUT; fi
+				;;
+			6) # Confirm layout
+				# Sum up sizes and check if they exceed the disk size
+				velo_disk_probe "$VELO_S_DISK"
+				if [ -n "$_VDP_SECT" ] && [ "$_VDP_SECT" -gt 0 ]; then
+					_disk_mib=$((_VDP_SECT / 2048))
+				else
+					_disk_mib=0
+				fi
+
+				_swap_mib=$(size_to_mib "$VELO_S_PART_SWAP")
+				_tmp_mib=$(size_to_mib "$VELO_S_PART_TMP")
+				_var_mib=$(size_to_mib "$VELO_S_PART_VAR")
+				_usr_mib=$(size_to_mib "$VELO_S_PART_USR")
+				_usrlocal_mib=$(size_to_mib "$VELO_S_PART_USRLOCAL")
+				_home_mib=0
+				if [ "$VELO_S_PART_HOME" != "*" ]; then
+					_home_mib=$(size_to_mib "$VELO_S_PART_HOME")
+				fi
+
+				_sum_mib=$((_swap_mib + _tmp_mib + _var_mib + _usr_mib + _usrlocal_mib + _home_mib))
+
+				if [ "$_swap_mib" -le 0 ] && [ "$VELO_S_PART_SWAP" != "*" ]; then
+					tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 10)) "$VELO_BOX_W" "Invalid Swap" \
+						"Swap partition size cannot be empty or zero."
+					continue
+				fi
+
+				if [ "$_disk_mib" -gt 0 ]; then
+					_min_needed=$((_sum_mib + 4096)) # sum + 4GB for root and safety
+					if [ "$_min_needed" -gt "$_disk_mib" ]; then
+						_disk_gib=$((_disk_mib / 1024))
+						_needed_gib=$((_min_needed / 1024))
+						tui_msgbox "$VELO_BOX_X" $((VELO_BOX_Y + 10)) "$VELO_BOX_W" "Too Small" \
+							"Layout size ($_needed_gib GB) exceeds disk size ($_disk_gib GB)." \
+							"Decrease partition sizes or free space."
+						continue
+					fi
+				fi
+				break
+				;;
+			esac
+		done
+	else
+		VELO_S_LAYOUT="auto"
+	fi
+	return 0
+}
+
 
 # Summary / Ворота-СТОП.  Returns 0 = Yes (print plan), 1 = No (revise).
 _wiz_summary() {
@@ -1238,7 +1413,7 @@ _wiz_summary() {
 		_ws_enc="no"
 		_ws_boot="(installer default; FDE only)"
 	fi
-	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 14 "Summary -- review before planning (FINAL GATE)"
+	tui_box "$VELO_BOX_X" "$VELO_BOX_Y" "$VELO_BOX_W" 15 "Summary -- review before planning (FINAL GATE)"
 	# disk: uses the SHORT 6-col "disk: " prefix (NOT the 12-col label grid) and is
 	# NEVER clipped -- matching the destroy-gate, it keeps the enriched identity
 	# within the 61-col body with zero slip (worst-case row 55 + 6 = 61), so the
@@ -1248,16 +1423,25 @@ _wiz_summary() {
 	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 1)) "disk: $(velo_disk_row "$VELO_S_DISK")"
 	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 2)) "encryption: $_ws_enc"
 	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 3)) "boot:       $_ws_boot"
+	if [ "$VELO_S_LAYOUT" = "custom" ]; then
+		_ws_layout="custom (swap=$VELO_S_PART_SWAP tmp=$VELO_S_PART_TMP var=$VELO_S_PART_VAR usr=$VELO_S_PART_USR local=$VELO_S_PART_USRLOCAL home=$VELO_S_PART_HOME)"
+		if [ ${#_ws_layout} -gt 49 ]; then
+			_ws_layout="$(_substr "$_ws_layout" 0 45) ..."
+		fi
+	else
+		_ws_layout="auto"
+	fi
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 4)) "layout:     $_ws_layout"
 	# hostname reaches ~50 chars (tui_input cap) or 63 (env-seeded) -> clip to the
 	# 61-col body exactly like packages below, so a long name cannot wrap onto the
 	# wifi: row.  (profile/protection are short enums -- no clip needed.)
 	_ws_host="$VELO_S_HOSTNAME"
 	[ ${#_ws_host} -gt 49 ] && _ws_host="$(_substr "$_ws_host" 0 45) ..."
-	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 4)) "hostname:   $_ws_host"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 5)) "hostname:   $_ws_host"
 	_ws_wifi="${VELO_S_WIFI_SSID:-(skipped)}"
 	[ ${#_ws_wifi} -gt 49 ] && _ws_wifi="$(_substr "$_ws_wifi" 0 45) ..."
-	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 5)) "wifi:       $_ws_wifi"
-	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 6)) "profile:    $VELO_S_PROFILE"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 6)) "wifi:       $_ws_wifi"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 7)) "profile:    $VELO_S_PROFILE"
 	# Clip the (long, firefox-profile) package list to the 61-col body so it cannot
 	# wrap onto and corrupt the rows below (2026-06-08: 14 pkgs overran into the
 	# protection line).  "packages:   " is 12 cols -> 49 left; ASCII ellipsis.  The
@@ -1266,9 +1450,9 @@ _wiz_summary() {
 	if [ ${#_ws_pkgs} -gt 49 ]; then
 		_ws_pkgs="$(_substr "$_ws_pkgs" 0 45) ..."
 	fi
-	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 7)) "packages:   $_ws_pkgs"
-	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 8)) "protection: $VELO_S_STARTMODE"
-	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 9)) "passwords:  set (root, user)"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 8)) "packages:   $_ws_pkgs"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 9)) "protection: $VELO_S_STARTMODE"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) "passwords:  set (root, user)"
 	# Tell the truth about Yes HERE too (mirrors _wiz_welcome): on armed media Yes
 	# proceeds PAST the printed plan to velo_execute's disk-erase gate and the real
 	# install; only the unarmed planner merely prints.  velo_armed is the gate.
@@ -1277,9 +1461,9 @@ _wiz_summary() {
 	else
 		_ws_yes="DRY-RUN: choosing Yes only PRINTS the plan."
 	fi
-	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 10)) "$_ws_yes"
+	_text_at $((VELO_BOX_X + 2)) $((VELO_BOX_Y + 11)) "$_ws_yes"
 	_wiz_help "revise" "sizes"
-	tui_confirm "$VELO_BOX_X" $((VELO_BOX_Y + 11)) "$VELO_BOX_W" "Confirm" "Generate the install plan now?"
+	tui_confirm "$VELO_BOX_X" $((VELO_BOX_Y + 12)) "$VELO_BOX_W" "Confirm" "Generate the install plan now?"
 }
 
 # ===========================================================================
@@ -1458,7 +1642,9 @@ velo_run_crypto() {
 	# image).  8 MiB clears the MBR/GPT-primary + the disklabel + the softraid
 	# metadata at the chunk head.  /dev/r<disk>c is the whole-disk raw node MAKEDEV
 	# made above.  FAIL CLOSED: if we cannot wipe, do NOT partition.
-	dd if=/dev/zero of="/dev/r${_vrc_disk}c" bs=1m count=$VELO_WIPE_MIB >/dev/null 2>&1 || return 1
+	dd if=/dev/zero of="/dev/r${_vrc_disk}c" bs=1m count=$VELO_WIPE_MIB >/dev/null 2>&1 &
+	tui_spinner $! "velo: zeroing target disk head"
+	wait $! || return 1
 	# shellcheck disable=SC2086
 	fdisk $_vrc_fargs "$_vrc_disk"                     || return 1
 	# hybrid: shrink A6 and add 0xEF EFI tail (step 2; step 1 = fdisk -iy above).
@@ -1475,17 +1661,39 @@ w
 q
 EOF
 	print -r -- "$VELO_S_PASSPHRASE" | \
-		bioctl -Cforce -cC -l"${_vrc_disk}a" -s softraid0   || return 1
+		bioctl -Cforce -cC -l"${_vrc_disk}a" -s softraid0 >/dev/null 2>&1 &
+	tui_spinner $! "velo: initializing CRYPTO volume"
+	wait $! || return 1
 	_vrc_unit=$(velo_crypto_unit) || return 1
 	is_valid_disk "$_vrc_unit"    || return 1
 	( cd /dev && sh MAKEDEV "$_vrc_unit" ) 2>/dev/null || true
-	dd if=/dev/zero of="/dev/r${_vrc_unit}c" bs=1m count=1 >/dev/null 2>&1 \
-		|| return 1
+	dd if=/dev/zero of="/dev/r${_vrc_unit}c" bs=1m count=1 >/dev/null 2>&1 &
+	tui_spinner $! "velo: clearing crypto volume metadata"
+	wait $! || return 1
 	# Return the unit via a GLOBAL, NOT stdout: fdisk/disklabel/bioctl above print
 	# to stdout (visible progress), so a $() capture would mix that noise with the
 	# unit.  velo_execute reads VELO_CRYPTO_UNIT.
 	VELO_CRYPTO_UNIT=$_vrc_unit
 	return 0
+}
+
+# --- velo_write_disklabel_template : write custom layout template -----------
+# If layout is custom, writes the disklabel template to /tmp/custom.disklabel.
+velo_write_disklabel_template() {
+	[ "$VELO_S_LAYOUT" = "custom" ] || return 0
+	_wdt_file="/tmp/custom.disklabel"
+	# Make sure the directory /tmp exists (always does, but good practice)
+	mkdir -p /tmp 2>/dev/null || true
+	cat <<EOF >"$_wdt_file"
+/          2G
+swap       $VELO_S_PART_SWAP
+/tmp       $VELO_S_PART_TMP
+/var       $VELO_S_PART_VAR
+/usr       $VELO_S_PART_USR
+/usr/local $VELO_S_PART_USRLOCAL
+/home      $VELO_S_PART_HOME
+EOF
+	chmod 0644 "$_wdt_file" 2>/dev/null || true
 }
 
 # velo_execute -- the gated real-install driver.  rc: 0 ok, 2 INERT, 1 abort/fail.
@@ -1508,7 +1716,7 @@ velo_execute() {
 		else
 			_vx_target_size="unknown"
 		fi
-		_putln "velo: REFUSING -- homely requires a target of at least 28 GiB." >&2
+		_putln "velo: REFUSING -- $VELO_S_PROFILE requires a target of at least $([ "$VELO_S_PROFILE" = homely ] && echo "28 GiB" || echo "16 GiB")." >&2
 		_putln "velo: detected size for $VELO_S_DISK: $_vx_target_size; nothing was written." >&2
 		return 1
 	fi
@@ -1626,6 +1834,7 @@ velo_execute() {
 	# 0600 FROM THE START via a subshell umask (a post-write chmod would leave a
 	# brief world-readable window on the hashes); rm any pre-existing path first so a
 	# planted symlink cannot redirect the hash write.  Trailing chmod is belt-and-braces.
+	velo_write_disklabel_template
 	rm -f "$_vx_rf" 2>/dev/null || true
 	if ! ( umask 077; gen_install_conf >"$_vx_rf" ); then
 		_putln "velo: ERROR generating install.conf" >&2; return 1
@@ -1750,15 +1959,15 @@ _wiz_complete() {
 # Drive all screens with ESC-steps-back navigation.
 velo_wizard() {
 	tui_init
-
 	_wz_screen=0
-	# Total CONFIG-screen count for the "Step k/N" counters.  FIXED at 10 (velo is
-	# FDE-first: the boot-mode screen is screen 10, and the disk-erase path even
+
+	# Total CONFIG-screen count for the "Step k/N" counters.  FIXED at 11 (velo is
+	# FDE-first: the boot-mode screen is screen 11, and the disk-erase path even
 	# REQUIRES encrypt=yes).  Held constant -- NOT recomputed after the encrypt
 	# choice -- so the denominator never changes mid-wizard.  A plaintext install
-	# simply skips screen 10 and ends at "9/10" -> summary; the denominator stays
+	# simply skips screen 11 and ends at "10/11" -> summary; the denominator stays
 	# put either way.  welcome and the summary FINAL GATE sit OUTSIDE it.
-	_wz_total=10
+	_wz_total=11
 	while :; do
 		case "$_wz_screen" in
 		0)
@@ -1774,25 +1983,26 @@ velo_wizard() {
 		2)
 			if _wiz_encrypt; then _wz_screen=3; else _wz_screen=1; fi
 			;;
-		3) if _wiz_rootpw;    then _wz_screen=4; else _wz_screen=2; fi ;;
-		4) if _wiz_userpw;    then _wz_screen=5; else _wz_screen=3; fi ;;
-		5) if _wiz_hostname;  then _wz_screen=6; else _wz_screen=4; fi ;;
-		6) if _wiz_wifi;      then _wz_screen=7; else _wz_screen=5; fi ;;
-		7) if _wiz_profile;   then _wz_screen=8; else _wz_screen=6; fi ;;
-		8) if _wiz_packages;  then _wz_screen=9; else _wz_screen=7; fi ;;
-		9) if _wiz_startmode; then _wz_screen=10; else _wz_screen=8; fi ;;
-		10)
+		3) if _wiz_layout;    then _wz_screen=4; else _wz_screen=2; fi ;;
+		4) if _wiz_rootpw;    then _wz_screen=5; else _wz_screen=3; fi ;;
+		5) if _wiz_userpw;    then _wz_screen=6; else _wz_screen=4; fi ;;
+		6) if _wiz_hostname;  then _wz_screen=7; else _wz_screen=5; fi ;;
+		7) if _wiz_wifi;      then _wz_screen=8; else _wz_screen=6; fi ;;
+		8) if _wiz_profile;   then _wz_screen=9; else _wz_screen=7; fi ;;
+		9) if _wiz_packages;  then _wz_screen=10; else _wz_screen=8; fi ;;
+		10) if _wiz_startmode; then _wz_screen=11; else _wz_screen=9; fi ;;
+		11)
 			# Boot/firmware target -- FDE only.  A plaintext install skips
 			# straight to the summary (the stock installer lays out its disk);
 			# only an encrypted install reaches _wiz_bootmode, where ESC steps
 			# back to start mode.
 			if [ "$VELO_S_ENCRYPT" = "yes" ]; then
-				if _wiz_bootmode; then _wz_screen=11; else _wz_screen=9; fi
+				if _wiz_bootmode; then _wz_screen=12; else _wz_screen=10; fi
 			else
-				_wz_screen=11
+				_wz_screen=12
 			fi
 			;;
-		11)
+		12)
 			if _wiz_summary; then
 				break          # Yes -> build & print the plan
 			else

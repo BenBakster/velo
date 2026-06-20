@@ -1,0 +1,11 @@
+#!/bin/sh
+# velo terminal: xterm-only session (startx; no WM/DM).
+. "$HOME/.velo-xkb" 2>/dev/null
+export LANG=en_US.UTF-8
+export LC_CTYPE=en_US.UTF-8
+if [ -n "${VELO_XKB_LAYOUTS:-}" ]; then
+	setxkbmap -layout "$VELO_XKB_LAYOUTS" -option "${VELO_XKB_TOGGLE:-grp:shift_alt_toggle}" &
+fi
+xrdb -merge "$HOME/.Xdefaults" 2>/dev/null
+xsetroot -solid '#1d2021'
+exec xterm -geometry 100x30+0+0 -fa 'DejaVu Sans Mono' -fs 11

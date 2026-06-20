@@ -81,6 +81,23 @@ is_valid_disk '$(reboot)';     t_rc "is_valid_disk cmdsub reject"    1 $?
 is_valid_disk 'sd0|sh';        t_rc "is_valid_disk pipe reject"      1 $?
 
 # ===========================================================================
+#  1b. is_valid_size / size_to_mib
+# ===========================================================================
+is_valid_size 4G;    t_rc "is_valid_size 4G accept" 0 $?
+is_valid_size 250M;  t_rc "is_valid_size 250M accept" 0 $?
+is_valid_size "*";     t_rc "is_valid_size * accept" 0 $?
+is_valid_size "";    t_rc "is_valid_size empty reject" 1 $?
+is_valid_size "2G "; t_rc "is_valid_size trailing-space reject" 1 $?
+is_valid_size "2;rm"; t_rc "is_valid_size injection reject" 1 $?
+
+t_eq "size_to_mib 4G" "4096" "$(size_to_mib 4G)"
+t_eq "size_to_mib 250M" "250" "$(size_to_mib 250M)"
+t_eq "size_to_mib 1T" "1048576" "$(size_to_mib 1T)"
+t_eq "size_to_mib *" "0" "$(size_to_mib *)"
+t_eq "size_to_mib empty" "0" "$(size_to_mib '')"
+t_eq "size_to_mib invalid" "0" "$(size_to_mib 'abc')"
+
+# ===========================================================================
 #  2. velo_list_disks (injected via VELO_FAKE_DISKS)
 # ===========================================================================
 # Normalise the newline-separated output to a single trailing-spaced line.
@@ -112,7 +129,8 @@ unset VELO_FAKE_DISKS
 t_eq "idx_to_profile 0 homely"  "homely"  "$(idx_to_profile 0)"
 t_eq "idx_to_profile 1 minimal"  "minimal"  "$(idx_to_profile 1)"
 t_eq "idx_to_profile 2 fortress" "fortress" "$(idx_to_profile 2)"
-idx_to_profile 3 >/dev/null; t_rc "idx_to_profile 3 nonzero" 1 $?
+t_eq "idx_to_profile 3 terminal" "terminal" "$(idx_to_profile 3)"
+idx_to_profile 4 >/dev/null; t_rc "idx_to_profile 4 nonzero" 1 $?
 
 t_eq "idx_to_startmode 0 L1" "L1" "$(idx_to_startmode 0)"
 t_eq "idx_to_startmode 1 L2" "L2" "$(idx_to_startmode 1)"
@@ -175,6 +193,14 @@ t_has "profile_pkgs homely has terminator" "$(profile_pkgs homely)" "terminator"
 t_has "profile_pkgs homely has thunar" "$(profile_pkgs homely)" "thunar"
 t_has "profile_pkgs fortress has tor"   "$(profile_pkgs fortress)" "tor"
 t_has "profile_pkgs fortress has gnupg" "$(profile_pkgs fortress)" "gnupg"
+t_has "profile_pkgs terminal has xterm" "$(profile_pkgs terminal)" "xterm"
+t_has "profile_pkgs terminal has noto-fonts" "$(profile_pkgs terminal)" "noto-fonts"
+t_has "profile_pkgs terminal has git" "$(profile_pkgs terminal)" "git"
+t_has "profile_pkgs terminal has curl" "$(profile_pkgs terminal)" "curl"
+t_has "profile_pkgs terminal has vim" "$(profile_pkgs terminal)" "vim"
+t_has "profile_pkgs terminal has tmux" "$(profile_pkgs terminal)" "tmux"
+t_hasnt "profile_pkgs terminal hasnt openbox" "$(profile_pkgs terminal)" "openbox"
+t_hasnt "profile_pkgs terminal hasnt firefox" "$(profile_pkgs terminal)" "firefox"
 profile_pkgs bogus >/dev/null; t_rc "profile_pkgs unknown nonzero" 1 $?
 t_eq  "profile_pkgs unknown empty" "" "$(profile_pkgs bogus)"
 
@@ -200,6 +226,12 @@ t_hasnt "conf(no) never iwm0"    "$CONF_NO" "iwm0"
 t_hasnt "conf(no) NO passphrase" "$CONF_NO" "TOPSECRET-PASS-DO-NOT-LEAK"
 t_hasnt "conf(no) NO bioctl"     "$CONF_NO" "bioctl"
 t_hasnt "conf(no) NO fdisk"      "$CONF_NO" "fdisk"
+
+# custom layout
+CONF_CUSTOM=$(VELO_S_LAYOUT="custom" gen_install_conf)
+t_has "conf(custom) template line" "$CONF_CUSTOM" "URL to autopartitioning template for disklabel = file:///tmp/custom.disklabel"
+t_hasnt "conf(custom) no auto layout" "$CONF_CUSTOM" "Use (A)uto layout = auto"
+
 
 # set-location block (2026-06-08 Fujitsu fix): the FOUR install.sub prompts after
 # "Location of sets = disk" must be answered, or autoinstall takes the wrong
@@ -323,6 +355,9 @@ t_has  "answers encrypt line"       "$AB" "encrypt=yes"
 t_has  "answers wifi_ssid line"     "$AB" "wifi_ssid=home-net"
 t_hasnt "answers NEVER carries PSK"  "$AB" "TOPSECRET-WIFI-PSK-DO-NOT-LEAK"
 t_hasnt "answers carries no wifi_psk key" "$AB" "wifi_psk"
+t_has  "answers layout line"          "$AB" "layout=auto"
+t_has  "answers part_swap line"       "$AB" "part_swap=4G"
+t_has  "answers part_home line"       "$AB" "part_home=*"
 # empty SSID -> blank "wifi_ssid=" line (the common "skip Wi-Fi" case); the key
 # stays present so install.site.velo parses a complete contract.
 VELO_S_WIFI_SSID=""
@@ -839,6 +874,7 @@ unset -f disklabel dmesg mount 2>/dev/null
 #      of the threshold trips a visible assertion.
 # ===========================================================================
 t_eq "homely min-bytes constant == 28 GiB" "30064771072" "$VELO_HOMELY_MIN_BYTES"
+t_eq "terminal min-bytes constant == 16 GiB" "17179869184" "$VELO_TERMINAL_MIN_BYTES"
 disklabel() {
 	case "$1" in
 	sd3) cat <<'L'
@@ -865,6 +901,18 @@ bytes/sector: 512
 total sectors: 58720255
 L
 		;;                                              # one sector UNDER 28 GiB
+	sd8) cat <<'L'
+duid: 0000000000000000
+bytes/sector: 512
+total sectors: 33554432
+L
+		;;                                              # EXACTLY 16 GiB (boundary)
+	sd9) cat <<'L'
+duid: 0000000000000000
+bytes/sector: 512
+total sectors: 33554431
+L
+		;;                                              # one sector UNDER 16 GiB
 	*) return 1 ;;                                          # sd7 -> disklabel fails
 	esac
 }
@@ -873,6 +921,11 @@ velo_profile_target_size_ok sd3 homely; t_rc "size-gate homely 1.3G reject"     
 velo_profile_target_size_ok sd5 homely; t_rc "size-gate homely EXACTLY 28 GiB accept (-ge)" 0 $?
 velo_profile_target_size_ok sd6 homely; t_rc "size-gate homely one-sector-under reject" 1 $?
 velo_profile_target_size_ok sd7 homely; t_rc "size-gate homely unreadable label reject" 1 $?
+velo_profile_target_size_ok sd4 terminal; t_rc "size-gate terminal 447G accept"            0 $?
+velo_profile_target_size_ok sd3 terminal; t_rc "size-gate terminal 1.3G reject"            1 $?
+velo_profile_target_size_ok sd8 terminal; t_rc "size-gate terminal EXACTLY 16 GiB accept (-ge)" 0 $?
+velo_profile_target_size_ok sd9 terminal; t_rc "size-gate terminal one-sector-under reject" 1 $?
+velo_profile_target_size_ok sd7 terminal; t_rc "size-gate terminal unreadable label reject" 1 $?
 # minimal/fortress are exempt -- the gate returns 0 even on the tiny disk, and
 # without ever needing a readable size.
 velo_profile_target_size_ok sd3 minimal;  t_rc "size-gate minimal bypasses (tiny ok)"  0 $?
@@ -928,6 +981,40 @@ t_eq "homely gate REFUSES (rc1) a sub-28-GiB target"     "1"      "$1"
 t_eq "homely gate refused BEFORE confirm"                "no"     "$2"
 t_eq "homely gate refused BEFORE crypto"                 "no"     "$3"
 t_eq "homely gate PASSES ample target -> confirm (ctrl)" "called" "$4"
+
+_TSG=$(
+	VELO_ALLOW_EXECUTE=yes          # arm (contained in this subshell only)
+	VELO_S_PROFILE=terminal
+	VELO_S_DISK=sd0
+	VELO_S_ENCRYPT=yes; VELO_S_BOOTMODE=uefi   # resolvable mode; crypto path live
+	VELO_HAS_PRINT=1; VELO_S_ROOTPW=x; VELO_S_USERPW=x
+	# Satisfy the read-only pre-flight so case B actually REACHES the confirm gate.
+	velo_disk_busy()       { return 1; }            # target not mounted
+	velo_disk_is_media()   { return 1; }            # target is NOT the medium
+	velo_find_media_disk() { echo sd1; return 0; }  # a unique medium exists
+	is_valid_disk()        { return 0; }
+	encrypt()              { echo '$2b$10$stub'; }   # bcrypt-shaped hash
+	velo_clear()               { return 0; }
+	velo_confirm_destructive() { _CONF=called; return 1; }   # record + cancel
+	velo_run_crypto()          { _CRYP=called; return 0; }   # must never run in A
+	# Case A: tiny terminal target -> capacity gate refuses pre-confirm.
+	velo_disk_probe() { _VDP_SECT=2801024;  _VDP_BPS=512; return 0; }   # ~1.34 GiB
+	_CONF=no; _CRYP=no
+	velo_execute >/dev/null 2>&1; _rcA=$?
+	_confA=$_CONF; _crypA=$_CRYP
+	# Case B: ample terminal target -> gate passes, reaches confirm (which cancels).
+	velo_disk_probe() { _VDP_SECT=33554432; _VDP_BPS=512; return 0; }  # exactly 16 GiB
+	_CONF=no; _CRYP=no
+	velo_execute >/dev/null 2>&1
+	_confB=$_CONF
+	echo "$_rcA|$_confA|$_crypA|$_confB"
+)
+_OIFS=$IFS; IFS='|'; set -- $_TSG; IFS=$_OIFS
+t_eq "terminal gate REFUSES (rc1) a sub-16-GiB target"     "1"      "$1"
+t_eq "terminal gate refused BEFORE confirm"                "no"     "$2"
+t_eq "terminal gate refused BEFORE crypto"                 "no"     "$3"
+t_eq "terminal gate PASSES ample target -> confirm (ctrl)" "called" "$4"
+
 
 # ===========================================================================
 # 13. ARMED-AWARE SAFETY MESSAGES (welcome + summary tell the truth on armed

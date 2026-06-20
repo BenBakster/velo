@@ -178,6 +178,7 @@ stage_root() {
 	cp "$SITE"/usr/obj/_pkgs/minimal.list        "$_dr/usr/obj/_pkgs/"
 	cp "$SITE"/usr/obj/_pkgs/homely.list        "$_dr/usr/obj/_pkgs/"
 	cp "$SITE"/usr/obj/_pkgs/fortress.list       "$_dr/usr/obj/_pkgs/"
+	cp "$SITE"/usr/obj/_pkgs/terminal.list       "$_dr/usr/obj/_pkgs/"
 	cp "$SITE"/etc/tor/torrc                 "$_dr/etc/tor/torrc"
 	cp "$SITE"/etc/X11/xenodm/Xsetup_0       "$_dr/etc/X11/xenodm/Xsetup_0"
 	# seed a pre-existing rc.firsttime line so we can prove APPEND (not clobber).
@@ -292,6 +293,28 @@ v_nofile "DRY fortress/L3: Xsetup_0 pruned (!homely)" "$R2/etc/X11/xenodm/Xsetup
 RL2=$(cat "$R2/etc/rc.local" 2>/dev/null)
 v_has   "DRY fortress/L3: rc.local re-asserts pf at boot" "$RL2" "pfctl -f /etc/pf.conf"
 
+# --- C3: terminal + L2 + extra pkgs -----------------------------------------
+R5="$TMPBASE/r5"
+stage_root "$R5"
+cat >"$R5/etc/velo/answers" <<'ANS'
+schema=1
+profile=terminal
+startmode=L2
+pkgs=ripgrep jq node fzf
+hostname=velo-terminal
+encrypt=yes
+ANS
+run_site "$R5"
+PF5=$(cat "$R5/etc/pf.conf" 2>/dev/null)
+v_has   "DRY terminal/L2: pf.conf is the L2 file" "$PF5" "L2 (= L1"
+IL5=$(cat "$R5/etc/velo/installed.list" 2>/dev/null)
+v_has   "DRY terminal/L2: installed.list has xterm" "$IL5" "xterm"
+v_has   "DRY terminal/L2: installed.list has ripgrep (opt-in)" "$IL5" "ripgrep"
+v_nofile "DRY terminal/L2: torrc pruned (!L3)"     "$R5/etc/tor/torrc"
+v_nofile "DRY terminal/L2: Xsetup_0 pruned (!homely)" "$R5/etc/X11/xenodm/Xsetup_0"
+OUT5=$(cat "$R5/.site.out" 2>/dev/null)
+v_has   "DRY terminal/L2: would 'rcctl disable xenodm' logged" "$OUT5" "would 'rcctl disable xenodm'"
+
 # --- D: SAFE FLOOR -- missing answers file -> minimal + L1 ------------------
 R3="$TMPBASE/r3"
 stage_root "$R3"
@@ -389,7 +412,7 @@ xcheck() {
 	# shellcheck disable=SC1090
 	VELO_SOURCED=1 . "$SRC"
 	_xc_fail=0
-	for _p in minimal homely fortress; do
+	for _p in minimal homely fortress terminal; do
 		_exp=$(profile_pkgs "$_p")
 		_lf="$SITE/usr/obj/_pkgs/${_p}.list"
 		_got=$(list_join "$_lf")
@@ -400,14 +423,14 @@ xcheck() {
 		fi
 	done
 	# the wizard's profile/startmode token lists must be exactly these.
-	[ "$VELO_PROFILES" = "homely minimal fortress" ] || { echo "  VELO_PROFILES drift: [$VELO_PROFILES]" >&2; _xc_fail=1; }
+	[ "$VELO_PROFILES" = "homely minimal fortress terminal" ] || { echo "  VELO_PROFILES drift: [$VELO_PROFILES]" >&2; _xc_fail=1; }
 	[ "$VELO_STARTMODES" = "L1 L2 L3" ] || { echo "  VELO_STARTMODES drift: [$VELO_STARTMODES]" >&2; _xc_fail=1; }
 	return $_xc_fail
 }
 ( xcheck ); v_true "x-check: *.list == profile_pkgs() and profile/startmode tokens match src/velo-install" $?
 
 # Also assert install.site's own whitelists match the wizard's enums.
-v_has "install.site profile whitelist matches" "$IS_BODY" "minimal|homely|fortress"
+v_has "install.site profile whitelist matches" "$IS_BODY" "minimal|homely|fortress|terminal"
 v_has "install.site startmode whitelist matches" "$IS_BODY" "L1|L2|L3"
 
 # ===========================================================================
@@ -479,6 +502,8 @@ v_file "skel/.kshrc present"   "$SITE/etc/skel/.kshrc"
 v_file "minimal.list present"  "$SITE/usr/obj/_pkgs/minimal.list"
 v_file "homely.list present"  "$SITE/usr/obj/_pkgs/homely.list"
 v_file "fortress.list present" "$SITE/usr/obj/_pkgs/fortress.list"
+v_file "terminal.list present" "$SITE/usr/obj/_pkgs/terminal.list"
+v_file "skel/.xsession-terminal present" "$SITE/etc/skel/.xsession-terminal"
 # answers must NOT be shipped in the authored tree (the TUI writes it at install).
 v_nofile "no answers file baked into the static tree" "$SITE/etc/velo/answers"
 # hostname.iwm0 must be present as a template but must NOT contain real PSK values.

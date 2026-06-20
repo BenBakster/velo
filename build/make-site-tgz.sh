@@ -74,7 +74,7 @@ check_lists() {
 	# shellcheck disable=SC1090
 	VELO_SOURCED=1 . "$SRC"
 	_cl_fail=0
-	for _p in minimal desktop fortress; do
+	for _p in minimal homely fortress terminal; do
 		_expected=$(profile_pkgs "$_p") || { echo "self-check: profile_pkgs $_p failed" >&2; _cl_fail=1; continue; }
 		_listf="$SITE/usr/obj/_pkgs/${_p}.list"
 		[ -f "$_listf" ] || { echo "self-check: missing $_listf" >&2; _cl_fail=1; continue; }
